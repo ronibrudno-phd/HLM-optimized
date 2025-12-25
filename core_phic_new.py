@@ -259,7 +259,7 @@ if __name__ == '__main__':
     Init_K(K_fit, N, INIT_K0=0.5)
 
        # Stable starter settings for N~28k
-    ETA0   = 1e-6
+    ETA0   = 1e-4
     ITERS0 = 200
 
     K_fit, c_traj, paras_fit = phic2_stable(
@@ -269,7 +269,7 @@ if __name__ == '__main__':
         ALPHA=phic2_alpha,
         ITERATION_MAX=ITERS0,
         checkpoint_interval=50,
-        eps_diag=1e-4,
+        eps_diag=1e-6,
         k_max=10.0,
         print_every_sec=10,
         )
