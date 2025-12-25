@@ -52,10 +52,10 @@ def K2P_inplace(K, out_P, identity):
     L11[idx, idx] += d[1:]
 
     # Solve L11 @ Q = I  (Cholesky path because assume_a='pos')
-   if _SOLVE_SUPPORTS_ASSUME_A:
-    Q = solve(L11, identity, assume_a='pos')
-   else:
-    Q = solve(L11, identity)  # fallback (no assume_a)  # (N-1)x(N-1)
+    if _SOLVE_SUPPORTS_ASSUME_A:
+        Q = solve(L11, identity, assume_a='pos')
+    else:
+        Q = solve(L11, identity)  # fallback (no assume_a)  # (N-1)x(N-1)
 
     # diag(Q)
     A = cp.diagonal(Q)
