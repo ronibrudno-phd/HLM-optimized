@@ -131,23 +131,40 @@ def phic2_stable(
     print_every_sec=10,
     patience=10,
     keep_best=True,
-    decay=0.3,          # NEW: reduce ETA by this factor on plateau
-    min_eta=1e-8,        # NEW: don't go below this
-    max_decays=5,        # NEW: stop after this many decays
+    decay=0.3,          # reduce ETA by this factor on plateau
+    min_eta=1e-8,        # don't go below this
+    max_decays=5,        # stop after this many decays
+    # ---- Solution 2 (optional restart) ----
+    enable_jitter_restart=True,
+    jitter_after_decays=2,        # start jittering after this many decays
+    jitter_sigma=1e-3,            # try 1e-4..1e-2 if needed
 ):
+    """
+    Original-style fixed-step gradient descent with two plateau escapes:
+      1) On plateau: restore best_K BEFORE reducing ETA.
+      2) Optional: jitter restart around best_K after a few decays.
+
+    Requires:
+      - K2P_inplace(K, P_buf, identity, eps_diag=...)
+      - project_K_inplace(K, k_max=...)
+      - Pdif2cost(P_dif, N)
+      - clear_cupy_pools()
+    """
     N = K.shape[0]
     stop_delta = ETA * ALPHA
     paras_fit = "%e\t%e\t%d\t" % (ETA, ALPHA, ITERATION_MAX)
 
-    P_buf = cp.empty((N, N), dtype=cp.float32)
+    # Reused buffers
+    P_buf = cp.empty((N, N), dtype=cp.float32)          # holds P then overwritten with P_dif
     identity = cp.eye(N - 1, dtype=cp.float32)
 
+    # Initial cost + initial gradient (P_dif in P_buf)
     K2P_inplace(K, P_buf, identity, eps_diag=eps_diag)
-    cp.subtract(P_buf, P_obs, out=P_buf)
+    cp.subtract(P_buf, P_obs, out=P_buf)                # now P_buf is P_dif
     cost = Pdif2cost(P_buf, N)
 
+    # trajectory on CPU: [cost, time, eta_used]
     c_traj = np.zeros((ITERATION_MAX + 1, 3), dtype=np.float64)
-    # columns: cost, time, eta_used
     c_traj[0, 0] = float(cost)
     c_traj[0, 1] = time.time()
     c_traj[0, 2] = float(ETA)
@@ -167,10 +184,11 @@ def phic2_stable(
     for iteration in range(1, ITERATION_MAX + 1):
         cost_bk = cost
 
-        # Fixed-step update (but ETA may be reduced on plateau)
+        # Fixed-step update (ETA may be reduced on plateau)
         K -= cp.float32(ETA) * P_buf
         project_K_inplace(K, k_max=k_max)
 
+        # Recompute P_dif in-place
         K2P_inplace(K, P_buf, identity, eps_diag=eps_diag)
         cp.subtract(P_buf, P_obs, out=P_buf)
         cost = Pdif2cost(P_buf, N)
@@ -196,25 +214,55 @@ def phic2_stable(
         else:
             worse_count += 1
 
-        # Plateau logic: reduce ETA and continue
+        # ----------------------------
+        # Solution 1 + Solution 2:
+        # Plateau logic: restore best_K, reduce ETA, optional jitter restart
+        # ----------------------------
         if worse_count >= patience:
+            # Always jump back to the best-known basin before changing ETA
+            if keep_best and best_K is not None:
+                K = best_K.copy()
+
+            # Stop if we can't/shouldn't decay further
             if ETA <= min_eta or decays_used >= max_decays:
                 print(f"Stopping: plateau persists. Best at iter {best_iter} cost={best_cost:.6e}")
                 if keep_best and best_K is not None:
                     K = best_K
                 break
+
+            # Reduce ETA
             ETA = max(ETA * decay, min_eta)
             decays_used += 1
             worse_count = 0
-            print(f"Plateau: reducing ETA -> {ETA:.2e} (decay {decays_used}/{max_decays})")
 
+            did_restart = False
+
+            # Optional: jitter restart around best_K after a few decays
+            if enable_jitter_restart and (decays_used >= jitter_after_decays) and keep_best and (best_K is not None):
+                sigma = cp.float32(jitter_sigma)
+                noise = sigma * cp.random.standard_normal(K.shape, dtype=cp.float32)
+                K = best_K.copy()
+                K += cp.float32(0.5) * (noise + noise.T)
+                project_K_inplace(K, k_max=k_max)
+                did_restart = True
+
+            # IMPORTANT: after restoring/restarting, recompute current gradient in P_buf
+            K2P_inplace(K, P_buf, identity, eps_diag=eps_diag)
+            cp.subtract(P_buf, P_obs, out=P_buf)
+
+            if did_restart:
+                print(f"Plateau: restored best_K + jitter restart, ETA -> {ETA:.2e} (decay {decays_used}/{max_decays})")
+            else:
+                print(f"Plateau: restored best_K, ETA -> {ETA:.2e} (decay {decays_used}/{max_decays})")
+
+        # Print progress
         now = time.time()
         if (now - last_print_time) > print_every_sec or iteration == 1 or iteration % 10 == 0:
             elapsed = now - c_traj[0, 1]
             print(f"{iteration}\t{cost_f:.6e}\t{cost_dif:+.3e}\t{ETA:.1e}\t{elapsed:6.1f}")
             last_print_time = now
 
-        # Optional convergence check
+        # Optional convergence check (same spirit as original)
         if (0 < cost_dif < stop_delta) and (iteration > 3):
             print(f"Converged (stop_delta) at iteration {iteration}")
             break
@@ -228,7 +276,13 @@ def phic2_stable(
             print(f"Checkpoint saved: {ck}")
 
     c_traj = c_traj[: iteration + 1]
+
+    # Ensure we return best_K if requested (even if loop ended without plateau stop)
+    if keep_best and best_K is not None:
+        K = best_K
+
     return K, c_traj, paras_fit
+
 
 
 
@@ -291,18 +345,21 @@ if __name__ == '__main__':
     print("\nStarting optimization (phase 1)...")
     start_opt = time.time()
     K_fit, c_traj, paras_fit = phic2_stable(
-        K_fit, P_obs,
-        ETA=ETA0,
-        ALPHA=phic2_alpha,
-        ITERATION_MAX=ITERS0,
-        checkpoint_interval=100,
-        eps_diag=1e-6,
-        k_max=10.0,
-        patience=10,
-        decay=0.3,
-        min_eta=1e-8,
-        max_decays=5,
-    )
+    K_fit, P_obs,
+    ETA=1e-6,
+    ALPHA=phic2_alpha,
+    ITERATION_MAX=500,
+    checkpoint_interval=100,
+    eps_diag=1e-6,
+    k_max=10.0,
+    patience=10,
+    decay=0.3,
+    min_eta=1e-8,
+    max_decays=5,
+    enable_jitter_restart=True,
+    jitter_after_decays=2,
+    jitter_sigma=1e-3,
+)
     opt_time = time.time() - start_opt
     print(f"\nOptimization completed in {opt_time:.2f}s ({opt_time/3600:.2f} hours)")
 
