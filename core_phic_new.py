@@ -342,7 +342,6 @@ if __name__ == '__main__':
         P_obs = cp.asarray(P_obs_np, dtype=cp.float32)
         del P_obs_np
     except Exception:
-        # Fallback parse (still float32)
         P_list = []
         with open(fhic) as fr:
             for line in fr:
@@ -369,68 +368,74 @@ if __name__ == '__main__':
     K_fit = cp.zeros((N, N), dtype=cp.float32)
     Init_K(K_fit, N, INIT_K0=0.5)
 
-         # Stable starter settings for N~28k
-       
+    # Settings
     ETA0 = 1e-6
-    ITERS0 = 1000
-    
-    print("\nStarting optimization (phase 1)...")
+    ITERS0 = 500  # you used 500 in the call; keep consistent
+
+    print("\nStarting optimization...")
     start_opt = time.time()
+
     K_fit, c_traj, paras_fit = phic2_stable(
-    K_fit, P_obs,
-    ETA=1e-6,
-    ALPHA=phic2_alpha,
-    ITERATION_MAX=500,
-    checkpoint_interval=100,
-    eps_diag=1e-6,
-    k_max=10.0,
-    patience=20,
-    decay=0.5,
-    min_eta=1e-8,
-    max_decays=8,
-    enable_jitter_restart=False,  # <-- important
-)
+        K_fit, P_obs,
+        ETA=ETA0,
+        ALPHA=phic2_alpha,
+        ITERATION_MAX=ITERS0,
+        checkpoint_interval=100,
+        eps_diag=1e-6,
+        k_max=10.0,
+        print_every_sec=10,
+        patience=20,
+        keep_best=True,
+        decay=0.5,
+        min_eta=1e-8,
+        max_decays=8,
+        enable_jitter_restart=False,
+    )
 
     opt_time = time.time() - start_opt
     print(f"\nOptimization completed in {opt_time:.2f}s ({opt_time/3600:.2f} hours)")
 
-    # Save log + K only (P_fit and Pearson masks are not feasible for large N)
+    # Save log + K
     fo = f"{dataDir}/N{N}"
     print("Saving results...")
     c_traj[:, 1] = c_traj[:, 1] - c_traj[0, 1]
     saveLg(fo + '.log', c_traj, "#%s\n#cost systemTime\n" % (paras_fit))
-
     cp.save(fo + '.K_fit.npy', K_fit)
+    print(f"Saved: {fo}.K_fit.npy and log")
 
-    print(f"N={N} too large: skipping P_fit + Pearson mask evaluation.")
-    print("Saved: K_fit.npy and log only.")
-    print(f"\nResults saved to {dataDir}")
-        # ---- Pearson check (sample-based; feasible for N~28k) ----
+    # ---- Pearson check (sample-based) + adjacent diagnostic ----
     print("\nEstimating Pearson correlations by sampling...")
-
     clear_cupy_pools()
 
-    # Allocate buffer for P_fit on GPU (NxN)
     P_fit_gpu = cp.empty((N, N), dtype=cp.float32)
-
-    # Identity (N-1)x(N-1). If you already have one from training, reuse it.
     identity_eval = cp.eye(N - 1, dtype=cp.float32)
 
     print("Computing P_fit on GPU (one-time)...")
     K2P_inplace(K_fit, P_fit_gpu, identity_eval, eps_diag=1e-6)
 
-    # Sample Pearson (increase n_samples for more stable estimate)
     p1, p2, nz = pearson_sample(P_fit_gpu, P_obs, n_samples=1_000_000, seed=0)
     print(f"Sample Pearson p1 (upper triangle): {p1:.6f}")
     print(f"Sample Pearson p2 (obs>0):          {p2:.6f}   (nz samples={nz:,})")
 
-    # Save metrics
     with open(f"{fo}.pearson_sample.txt", "w") as fw:
         fw.write(f"N {N}\n")
         fw.write("n_samples 1000000\n")
         fw.write(f"p1_upper_triangle {p1:.8f}\n")
         fw.write(f"p2_obs_gt_0 {p2:.8f}\n")
         fw.write(f"nz_samples {nz}\n")
+
+    # Adjacent contact diagnostic (Lei Liu: good sign if ~0.1–0.4)
+    adj_obs = cp.asnumpy(P_obs.diagonal(1))
+    adj_fit = cp.asnumpy(P_fit_gpu.diagonal(1))
+
+    def summarize_adj(x, name):
+        x = x[np.isfinite(x)]
+        return (f"{name}: mean={x.mean():.4f}, median={np.median(x):.4f}, "
+                f"p10={np.quantile(x,0.10):.4f}, p90={np.quantile(x,0.90):.4f}, "
+                f"min={x.min():.4f}, max={x.max():.4f}")
+
+    print(summarize_adj(adj_obs, "P_obs diag+1"))
+    print(summarize_adj(adj_fit, "P_fit diag+1"))
 
     # Free eval buffers
     del P_fit_gpu, identity_eval
