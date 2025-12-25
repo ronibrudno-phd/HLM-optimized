@@ -131,7 +131,7 @@ def phic2_optimized(
     k_max=10.0,
     print_every_sec=10,
     max_jump_factor=5.0,   # reject if cost_new > max_jump_factor * cost_old
-    max_retries=2,         # retries per iteration with higher eps and smaller ETA
+    max_retries=4,         # retries per iteration with higher eps and smaller ETA
 ):
     """
     Fixed-ETA optimizer (original-style) + safety rails:
@@ -196,7 +196,7 @@ def phic2_optimized(
             cost_new_f = float(cost_new)
             
                         # Reject if non-finite OR if it increases cost beyond a tiny tolerance
-            tol_increase = 1e-5  # allow 0.0001% increases (noise)
+            tol_increase = 5e-5  # allow 0.0001% increases (noise)
             bad = (
                     (not np.isfinite(cost_new_f)) or
                     (cost_new_f > cost_prev * (1.0 + tol_increase)) or
@@ -208,7 +208,7 @@ def phic2_optimized(
                 retry += 1
                 # strengthen diagonal jitter and shrink step, then retry
                 eps_try = min(eps_try * 100.0, 1e-2)
-                eta_try = max(eta_try * 0.1, float(ETA) * 1e-4)  # don't go to zero
+                eta_try = max(eta_try * 0.1, 1e-12)  # don't go to zero
                 continue
 
             # Accept
@@ -222,8 +222,10 @@ def phic2_optimized(
             c_traj[iteration, 0] = cost_prev
             c_traj[iteration, 1] = time.time()
             c_traj[iteration, 2] = 1.0
-            print(f"Iteration {iteration}: failed after retries; rolled back and stopping.")
-            break
+            print(f"Iteration {iteration}: failed after retries; rolling back and reducing ETA.")
+            K[...] = K_prev
+            ETA *= 0.3
+            continue
 
         # Record accepted step
         cost_dif = float(cost_bk - cost)
@@ -330,7 +332,7 @@ if __name__ == '__main__':
         k_max=10.0,               # keep for now; only increase if progress stalls
         print_every_sec=10,
         max_jump_factor=5.0,      # stricter: reject big blow-ups early
-        max_retries=3,
+        max_retries=4,
     )
 
     opt_time = time.time() - start_opt
