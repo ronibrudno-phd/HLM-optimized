@@ -196,11 +196,13 @@ def phic2_optimized(
             cost_new_f = float(cost_new)
             
                         # Reject if non-finite OR if it increases cost beyond a tiny tolerance
-            tol_increase = 1e-6  # allow 0.0001% increases (noise)
+            tol_increase = 1e-5  # allow 0.0001% increases (noise)
             bad = (
-                (not np.isfinite(cost_new_f)) or
-                (cost_new_f > cost_prev * (1.0 + tol_increase))
-            )
+                    (not np.isfinite(cost_new_f)) or
+                    (cost_new_f > cost_prev * (1.0 + tol_increase)) or
+                    (cost_new_f > cost_prev * max_jump_factor)
+                    )
+
 
             if bad:
                 retry += 1
