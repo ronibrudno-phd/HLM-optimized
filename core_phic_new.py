@@ -130,15 +130,16 @@ def phic2_optimized(
     eps_diag=1e-6,
     k_max=10.0,
     print_every_sec=10,
-    max_jump_factor=10.0,   # reject if cost_new > max_jump_factor * cost_old
-    max_retries=2,          # retries per iteration with higher eps and smaller eta
+    max_jump_factor=5.0,   # reject if cost_new > max_jump_factor * cost_old
+    max_retries=2,         # retries per iteration with higher eps and smaller ETA
 ):
     """
-    Stabilized optimizer for large N with:
+    Fixed-ETA optimizer (original-style) + safety rails:
       - Single NxN buffer reused (P_calc -> P_dif)
-      - Projection of K each step
+      - Projection of K each step (symmetry, nonnegativity, cap)
       - Reject/rollback on numerical blow-ups
-      - Retry with stronger diagonal jitter + smaller eta
+      - Retry with stronger diagonal jitter + smaller ETA
+      - ETA stays constant unless a retry is needed
     """
     N = K.shape[0]
     stop_delta = ETA * ALPHA
@@ -147,7 +148,7 @@ def phic2_optimized(
     # NxN buffer reused: holds P then overwritten with P_dif
     P_buf = cp.empty((N, N), dtype=cp.float32)
 
-    # Identity (N-1)x(N-1)
+    # Identity for solve: (N-1)x(N-1)
     identity = cp.eye(N - 1, dtype=cp.float32)
 
     # Initial cost
@@ -155,16 +156,11 @@ def phic2_optimized(
     cp.subtract(P_buf, P_obs, out=P_buf)
     cost = Pdif2cost(P_buf, N)
 
-    # Trajectory on CPU
+    # Trajectory on CPU: [cost, time, rejected_flag]
     c_traj = np.zeros((ITERATION_MAX + 1, 3), dtype=np.float64)
-    # columns: cost, time, rejected_flag
     c_traj[0, 0] = float(cost)
     c_traj[0, 1] = time.time()
     c_traj[0, 2] = 0.0
-
-    eta = float(ETA)
-    eta_min = float(ETA) * 0.01
-    eta_max = float(ETA) * 5.0
 
     print(f"Starting optimization with N={N}, ETA={ETA:g}, ALPHA={ALPHA:g}")
     print(f"Initial cost: {float(cost):.6e}")
@@ -174,46 +170,45 @@ def phic2_optimized(
     rejected_total = 0
 
     for iteration in range(1, ITERATION_MAX + 1):
-        # Keep a backup of K so we can rollback if this step blows up
-        K_prev = K.copy()
         cost_prev = float(cost)
+        cost_bk = cost
+
+        # Backup K to rollback if needed
+        K_prev = K.copy()
 
         accepted = False
         retry = 0
         eps_try = float(eps_diag)
-        eta_try = float(eta)
+        eta_try = float(ETA)  # fixed ETA unless we retry
 
         while (not accepted) and (retry <= max_retries):
-            # Apply step from K_prev each retry (start clean)
+            # restart from backup for each retry attempt
             K[...] = K_prev
-            cost = cp.float32(cost_prev)
 
-            # Gradient step
+            # Step
             K -= cp.float32(eta_try) * P_buf
-
-            # Project to safe space
             project_K_inplace(K, k_max=k_max)
 
-            # Evaluate with current eps_try
+            # Evaluate
             K2P_inplace(K, P_buf, identity, eps_diag=eps_try)
             cp.subtract(P_buf, P_obs, out=P_buf)
             cost_new = Pdif2cost(P_buf, N)
-
             cost_new_f = float(cost_new)
+
             bad = (not np.isfinite(cost_new_f)) or (cost_new_f > max_jump_factor * cost_prev)
 
             if bad:
-                # Reject: increase regularization and shrink step, then retry
                 retry += 1
-                eps_try = min(eps_try * 100.0, 1e-2)   # ramp jitter fast, cap
-                eta_try = max(eta_try * 0.1, eta_min)  # shrink step fast
+                # strengthen diagonal jitter and shrink step, then retry
+                eps_try = min(eps_try * 100.0, 1e-2)
+                eta_try = max(eta_try * 0.1, float(ETA) * 1e-4)  # don't go to zero
                 continue
 
             # Accept
             accepted = True
             cost = cost_new
 
-        # If still not accepted after retries, rollback and stop
+        # If still not accepted, rollback and stop
         if not accepted:
             K[...] = K_prev
             rejected_total += 1
@@ -224,30 +219,27 @@ def phic2_optimized(
             break
 
         # Record accepted step
-        cost_dif = cost_prev - float(cost)
+        cost_dif = float(cost_bk - cost)
         c_traj[iteration, 0] = float(cost)
         c_traj[iteration, 1] = time.time()
         c_traj[iteration, 2] = 1.0 if (retry > 0) else 0.0
         if retry > 0:
             rejected_total += 1
 
-        # Update eta for next iteration (based on accepted result)
-        if np.isfinite(cost_dif) and cost_dif > 0:
-            eta = min(eta * 1.05, eta_max)
-        else:
-            eta = max(eta * 0.5, eta_min)
-
         # Print progress
         now = time.time()
-        if (now - last_print_time) > print_every_sec or iteration == 1 or (retry > 0):
+        if (now - last_print_time) > print_every_sec or iteration == 1 or (retry > 0) or (iteration % 10 == 0):
             elapsed = now - c_traj[0, 1]
             rej_flag = int(retry > 0)
-            print(f"{iteration}\t{float(cost):.6e}\t{cost_dif:+.3e}\t{eta:.3e}\t{elapsed:6.1f}\t{rej_flag}\t{retry}")
+            print(f"{iteration}\t{float(cost):.6e}\t{cost_dif:+.3e}\t{eta_try:.3e}\t{elapsed:6.1f}\t{rej_flag}\t{retry}")
             last_print_time = now
 
-        # Stopping criteria
+        # Stopping criteria (same spirit as original)
         if (0 < cost_dif < stop_delta) and (iteration > 3):
             print(f"Converged (stop_delta) at iteration {iteration}")
+            break
+        if not np.isfinite(float(cost)):
+            print(f"Optimization diverged (non-finite cost) at iteration {iteration}")
             break
 
         if iteration % 5 == 0:
@@ -262,6 +254,7 @@ def phic2_optimized(
     c_traj = c_traj[: last_it + 1]
     print(f"Total rejected/retried steps: {rejected_total}")
     return K, c_traj, paras_fit
+
 
 
 
@@ -315,8 +308,8 @@ if __name__ == '__main__':
     Init_K(K_fit, N, INIT_K0=0.5)
 
        # Stable starter settings for N~28k
-    ETA0   = 5e-7          # safer than 1e-6 (you already saw one huge spike)
-    ITERS0 = 50            # enough to see a trend; rollback protects you
+    ETA0   = 1e-06          # safer than 1e-6 (you already saw one huge spike)
+    ITERS0 = 100            # enough to see a trend; rollback protects you
     
     K_fit, c_traj, paras_fit = phic2_optimized(
         K_fit,
@@ -324,7 +317,7 @@ if __name__ == '__main__':
         ETA=ETA0,
         ALPHA=phic2_alpha,
         ITERATION_MAX=ITERS0,
-        checkpoint_interval=10,   # save K every 10 iters (uncompressed .npy)
+        checkpoint_interval=50,   # save K every 10 iters (uncompressed .npy)
         eps_diag=1e-6,            # base jitter; retries will raise it if needed
         k_max=10.0,               # keep for now; only increase if progress stalls
         print_every_sec=10,
