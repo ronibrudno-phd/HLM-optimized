@@ -50,37 +50,46 @@ def Init_K_gpu(K, INIT_K0=0.5):
 def K2P_cpu(K_cpu, N):
     """
     Optimized CPU K2P with float32 and minimal memory.
-    Avoids building M matrix to save memory.
+    Properly handles the graph Laplacian.
     """
     # All float32
     d = np.sum(K_cpu, axis=0, dtype=np.float32)
     
-    # L = diag(d) - K (build dense)
+    # L = diag(d) - K (graph Laplacian)
     L = np.diag(d) - K_cpu
     
-    # Solve L[1:N,1:N] @ Q = I (this is the fundamental bottleneck)
+    # Add small regularization to ensure L[1:N,1:N] is positive definite
+    # This is necessary because the initial K is very sparse (only tridiagonal)
+    eps = 1e-10
+    L[1:N, 1:N] += eps * np.eye(N-1, dtype=np.float32)
+    
+    # Solve L[1:N,1:N] @ Q = I for the pseudo-inverse
     I = np.eye(N-1, dtype=np.float32)
-    Q = cpu_solve(L[1:N, 1:N], I, assume_a='pos', overwrite_a=True, overwrite_b=True)
+    try:
+        Q = cpu_solve(L[1:N, 1:N], I, assume_a='pos', overwrite_a=True, overwrite_b=True, check_finite=False)
+    except np.linalg.LinAlgError:
+        # If still singular, add more regularization
+        print("Warning: Matrix near-singular, adding regularization...")
+        L[1:N, 1:N] += 1e-6 * np.eye(N-1, dtype=np.float32)
+        Q = cpu_solve(L[1:N, 1:N], I, assume_a='pos', overwrite_a=True, overwrite_b=True, check_finite=False)
     
-    # Diagonal
-    A = np.diag(Q).copy()
+    # Compute M = 0.5 * (Q + Q.T) for symmetry (this is critical!)
+    M = 0.5 * (Q + Q.T)
     
-    # Build G (float32) - use Q directly, avoid building M
+    # Diagonal of M
+    A = np.diag(M).copy()
+    
+    # Build G (float32)
     G = np.zeros((N, N), dtype=np.float32)
-    # G[1:N, 1:N] = -2*M + A + A.reshape(-1,1), but M = 0.5*(Q+Q.T)
-    # So: -2*M = -(Q+Q.T) = -Q - Q.T
-    # But for efficiency, we'll compute -2*0.5*(Q+Q.T) = -(Q+Q.T)
-    # Actually, to save memory, let's use Q directly:
-    # Since we need symmetry anyway, we can work with Q
-    G[1:N, 1:N] = -2.0 * Q + A + A.reshape(-1, 1)
+    G[1:N, 1:N] = -2.0 * M + A + A.reshape(-1, 1)
     G[0, 1:N] = A
     G[1:N, 0] = A
     
     # Free big stuff early
-    del Q, I, L, d, A
+    del Q, M, I, L, d, A
     gc.collect()
     
-    # P = (1 + 3*G)^(-1.5) - compute in-place-ish
+    # P = (1 + 3*G)^(-1.5)
     P = (1.0 + 3.0 * G) ** (-1.5)
     return P
 
