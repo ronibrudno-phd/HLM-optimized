@@ -119,33 +119,35 @@ def project_K_inplace(K, k_max=10.0):
     return K
 
 
-# ---------- Optimizer (stabilized, few-iteration-friendly) ----------
+# ---------- Optimizer (stabilized + rollback + retry) ----------
 def phic2_optimized(
     K,
     P_obs,
     ETA=1e-6,
     ALPHA=1e-10,
-    ITERATION_MAX=10,
+    ITERATION_MAX=50,
     checkpoint_interval=0,
     eps_diag=1e-6,
     k_max=10.0,
     print_every_sec=10,
+    max_jump_factor=10.0,   # reject if cost_new > max_jump_factor * cost_old
+    max_retries=2,          # retries per iteration with higher eps and smaller eta
 ):
     """
-    Lean + stabilized optimizer for large N:
-      - No momentum (saves memory and reduces instability)
+    Stabilized optimizer for large N with:
       - Single NxN buffer reused (P_calc -> P_dif)
-      - K projection each step to keep solve stable
-      - Very small ETA by default for N~28k+
+      - Projection of K each step
+      - Reject/rollback on numerical blow-ups
+      - Retry with stronger diagonal jitter + smaller eta
     """
     N = K.shape[0]
     stop_delta = ETA * ALPHA
     paras_fit = "%e\t%e\t%d\t" % (ETA, ALPHA, ITERATION_MAX)
 
-    # One reusable NxN buffer: holds P then overwritten with P_dif
+    # NxN buffer reused: holds P then overwritten with P_dif
     P_buf = cp.empty((N, N), dtype=cp.float32)
 
-    # Identity for solve: (N-1)x(N-1) float32
+    # Identity (N-1)x(N-1)
     identity = cp.eye(N - 1, dtype=cp.float32)
 
     # Initial cost
@@ -153,41 +155,83 @@ def phic2_optimized(
     cp.subtract(P_buf, P_obs, out=P_buf)
     cost = Pdif2cost(P_buf, N)
 
-    # Store cost trajectory on CPU (avoid huge GPU traj arrays)
-    c_traj = np.zeros((ITERATION_MAX + 1, 2), dtype=np.float64)
+    # Trajectory on CPU
+    c_traj = np.zeros((ITERATION_MAX + 1, 3), dtype=np.float64)
+    # columns: cost, time, rejected_flag
     c_traj[0, 0] = float(cost)
     c_traj[0, 1] = time.time()
+    c_traj[0, 2] = 0.0
 
     eta = float(ETA)
-    eta_min = float(ETA) * 0.01  # allow shrinking more
+    eta_min = float(ETA) * 0.01
     eta_max = float(ETA) * 5.0
 
-    print(f"Starting optimization with N={N}, ETA={ETA}, ALPHA={ALPHA}")
+    print(f"Starting optimization with N={N}, ETA={ETA:g}, ALPHA={ALPHA:g}")
     print(f"Initial cost: {float(cost):.6e}")
-    print("Iteration\tCost\t\tCost_diff\tEta\t\tTime(s)")
+    print("iter\tcost\t\tcost_diff\teta\t\tt(sec)\trej\tretry")
 
     last_print_time = time.time()
+    rejected_total = 0
 
     for iteration in range(1, ITERATION_MAX + 1):
-        cost_bk = cost
+        # Keep a backup of K so we can rollback if this step blows up
+        K_prev = K.copy()
+        cost_prev = float(cost)
 
-        # Gradient step
-        K -= cp.float32(eta) * P_buf
+        accepted = False
+        retry = 0
+        eps_try = float(eps_diag)
+        eta_try = float(eta)
 
-        # Project K back to a stable domain
-        project_K_inplace(K, k_max=k_max)
+        while (not accepted) and (retry <= max_retries):
+            # Apply step from K_prev each retry (start clean)
+            K[...] = K_prev
+            cost = cp.float32(cost_prev)
 
-        # Recompute P_dif in the same buffer
-        K2P_inplace(K, P_buf, identity, eps_diag=eps_diag)
-        cp.subtract(P_buf, P_obs, out=P_buf)
-        cost = Pdif2cost(P_buf, N)
+            # Gradient step
+            K -= cp.float32(eta_try) * P_buf
 
+            # Project to safe space
+            project_K_inplace(K, k_max=k_max)
+
+            # Evaluate with current eps_try
+            K2P_inplace(K, P_buf, identity, eps_diag=eps_try)
+            cp.subtract(P_buf, P_obs, out=P_buf)
+            cost_new = Pdif2cost(P_buf, N)
+
+            cost_new_f = float(cost_new)
+            bad = (not np.isfinite(cost_new_f)) or (cost_new_f > max_jump_factor * cost_prev)
+
+            if bad:
+                # Reject: increase regularization and shrink step, then retry
+                retry += 1
+                eps_try = min(eps_try * 100.0, 1e-2)   # ramp jitter fast, cap
+                eta_try = max(eta_try * 0.1, eta_min)  # shrink step fast
+                continue
+
+            # Accept
+            accepted = True
+            cost = cost_new
+
+        # If still not accepted after retries, rollback and stop
+        if not accepted:
+            K[...] = K_prev
+            rejected_total += 1
+            c_traj[iteration, 0] = cost_prev
+            c_traj[iteration, 1] = time.time()
+            c_traj[iteration, 2] = 1.0
+            print(f"Iteration {iteration}: failed after retries; rolled back and stopping.")
+            break
+
+        # Record accepted step
+        cost_dif = cost_prev - float(cost)
         c_traj[iteration, 0] = float(cost)
         c_traj[iteration, 1] = time.time()
+        c_traj[iteration, 2] = 1.0 if (retry > 0) else 0.0
+        if retry > 0:
+            rejected_total += 1
 
-        cost_dif = float(cost_bk - cost)
-
-        # Adaptive eta (very conservative)
+        # Update eta for next iteration (based on accepted result)
         if np.isfinite(cost_dif) and cost_dif > 0:
             eta = min(eta * 1.05, eta_max)
         else:
@@ -195,15 +239,13 @@ def phic2_optimized(
 
         # Print progress
         now = time.time()
-        if (now - last_print_time) > print_every_sec or iteration == 1:
+        if (now - last_print_time) > print_every_sec or iteration == 1 or (retry > 0):
             elapsed = now - c_traj[0, 1]
-            print(f"{iteration}\t\t{float(cost):.6e}\t{cost_dif:+.4e}\t{eta:.3e}\t{elapsed:.1f}")
+            rej_flag = int(retry > 0)
+            print(f"{iteration}\t{float(cost):.6e}\t{cost_dif:+.3e}\t{eta:.3e}\t{elapsed:6.1f}\t{rej_flag}\t{retry}")
             last_print_time = now
 
-        # Stops
-        if not np.isfinite(float(cost)):
-            print(f"Optimization diverged (non-finite cost) at iteration {iteration}")
-            break
+        # Stopping criteria
         if (0 < cost_dif < stop_delta) and (iteration > 3):
             print(f"Converged (stop_delta) at iteration {iteration}")
             break
@@ -211,16 +253,16 @@ def phic2_optimized(
         if iteration % 5 == 0:
             clear_cupy_pools()
 
-        # Optional checkpoint (K only, no compression)
         if checkpoint_interval and (iteration % checkpoint_interval == 0):
             ck = os.path.join(dataDir, f"checkpoint_iter{iteration}.K.npy")
             cp.save(ck, K)
             print(f"Checkpoint saved: {ck}")
 
-    # Trim trajectory to actual iterations done
     last_it = iteration
     c_traj = c_traj[: last_it + 1]
+    print(f"Total rejected/retried steps: {rejected_total}")
     return K, c_traj, paras_fit
+
 
 
 def saveLg(fn, xy, ct):
@@ -272,25 +314,23 @@ if __name__ == '__main__':
     K_fit = cp.zeros((N, N), dtype=cp.float32)
     Init_K(K_fit, N, INIT_K0=0.5)
 
-    # IMPORTANT: starting parameters for N~28k
-    # Start with small number of iterations to validate stability.
-    ETA0 = 1e-6
-    ITERS0 = 20  # bump once stable; start with 5 if you prefer
+   # Stable starter settings for N~28k
+ETA0   = 5e-7          # safer than 1e-6 (you already saw one huge spike)
+ITERS0 = 50            # enough to see a trend; rollback protects you
 
-    print("\nStarting optimization...")
-    start_opt = time.time()
-
-    K_fit, c_traj, paras_fit = phic2_optimized(
-        K_fit,
-        P_obs,
-        ETA=ETA0,
-        ALPHA=phic2_alpha,
-        ITERATION_MAX=ITERS0,
-        checkpoint_interval=0,   # set e.g. 5 or 10 if you want K checkpoints
-        eps_diag=1e-6,
-        k_max=10.0,
-        print_every_sec=10,
-    )
+K_fit, c_traj, paras_fit = phic2_optimized(
+    K_fit,
+    P_obs,
+    ETA=ETA0,
+    ALPHA=phic2_alpha,
+    ITERATION_MAX=ITERS0,
+    checkpoint_interval=10,   # save K every 10 iters (uncompressed .npy)
+    eps_diag=1e-6,            # base jitter; retries will raise it if needed
+    k_max=10.0,               # keep for now; only increase if progress stalls
+    print_every_sec=10,
+    max_jump_factor=5.0,      # stricter: reject big blow-ups early
+    max_retries=2,
+)
 
     opt_time = time.time() - start_opt
     print(f"\nOptimization completed in {opt_time:.2f}s ({opt_time/3600:.2f} hours)")
