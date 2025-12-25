@@ -348,7 +348,7 @@ if __name__ == '__main__':
         ETA=1e-4,
         ALPHA=phic2_alpha,
         ITERATION_MAX=1000000,
-        checkpoint_interval=5000,
+        checkpoint_interval=10000,
         patience=500,
         use_float32=use_float32
     )
