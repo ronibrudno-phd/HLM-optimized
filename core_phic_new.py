@@ -314,23 +314,23 @@ if __name__ == '__main__':
     K_fit = cp.zeros((N, N), dtype=cp.float32)
     Init_K(K_fit, N, INIT_K0=0.5)
 
-   # Stable starter settings for N~28k
-ETA0   = 5e-7          # safer than 1e-6 (you already saw one huge spike)
-ITERS0 = 50            # enough to see a trend; rollback protects you
-
-K_fit, c_traj, paras_fit = phic2_optimized(
-    K_fit,
-    P_obs,
-    ETA=ETA0,
-    ALPHA=phic2_alpha,
-    ITERATION_MAX=ITERS0,
-    checkpoint_interval=10,   # save K every 10 iters (uncompressed .npy)
-    eps_diag=1e-6,            # base jitter; retries will raise it if needed
-    k_max=10.0,               # keep for now; only increase if progress stalls
-    print_every_sec=10,
-    max_jump_factor=5.0,      # stricter: reject big blow-ups early
-    max_retries=2,
-)
+       # Stable starter settings for N~28k
+    ETA0   = 5e-7          # safer than 1e-6 (you already saw one huge spike)
+    ITERS0 = 50            # enough to see a trend; rollback protects you
+    
+    K_fit, c_traj, paras_fit = phic2_optimized(
+        K_fit,
+        P_obs,
+        ETA=ETA0,
+        ALPHA=phic2_alpha,
+        ITERATION_MAX=ITERS0,
+        checkpoint_interval=10,   # save K every 10 iters (uncompressed .npy)
+        eps_diag=1e-6,            # base jitter; retries will raise it if needed
+        k_max=10.0,               # keep for now; only increase if progress stalls
+        print_every_sec=10,
+        max_jump_factor=5.0,      # stricter: reject big blow-ups early
+        max_retries=2,
+    )
 
     opt_time = time.time() - start_opt
     print(f"\nOptimization completed in {opt_time:.2f}s ({opt_time/3600:.2f} hours)")
