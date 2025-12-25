@@ -43,7 +43,7 @@ def K2P(K, G_buffer, identity):
     
     # Use solve() instead of inv() - much faster
     # Solve L[1:N,1:N] @ Q = I for Q
-    Q = solve(L[1:N, 1:N], identity)
+    Q = solve(L[1:N, 1:N], identity, assume_a='pos')
     M = 0.5 * (Q + Q.T)
     A = cp.diag(M)
     
@@ -75,12 +75,12 @@ def phic2_optimized(K, ETA=1.0e-4, ALPHA=1.0e-4, ITERATION_MAX=10000,
     paras_fit = "%e\t%e\t%d\t" % (ETA, ALPHA, ITERATION_MAX)
     
     # Preallocate buffers
-    G_buffer = cp.zeros((N, N))
-    identity = cp.eye(N-1)
-    P_dif = cp.zeros((N, N))
+    G_buffer = cp.zeros((N, N), dtype=cp.float32)
+    identity = cp.eye(N-1, dtype=cp.float32)
+    P_dif = cp.zeros((N, N), dtype=cp.float32)
     
     # Momentum buffer
-    velocity = cp.zeros_like(K)
+    velocity = cp.zeros_like(K, dtype=cp.float32)
     momentum = 0.9
     
     # Adaptive learning rate
@@ -218,7 +218,7 @@ if __name__ == '__main__':
     # OPTIMIZATION 4: Use numpy.loadtxt for faster reading
     try:
         P_obs_np = np.loadtxt(fhic, comments='#')
-        P_obs = cp.array(P_obs_np)
+        P_obs = cp.array(P_obs_np, dtype=cp.float32)
     except:
         # Fallback to original method
         P_obs = []
@@ -227,7 +227,7 @@ if __name__ == '__main__':
                 if not line[0] == '#':
                     lt = line.strip().split()
                     P_obs.append(list(map(float, lt)))
-        P_obs = cp.array(P_obs)
+        P_obs = cp.array(P_obs, dtype=cp.float32)
     
     N = len(P_obs)
     print(f"Matrix size: N={N} ({N}x{N} = {N*N:,} elements)")
@@ -243,7 +243,7 @@ if __name__ == '__main__':
     
     # Minimization
     print("\nInitializing K matrix...")
-    K_fit = cp.zeros((N, N))
+    K_fit = cp.zeros((N, N), dtype=cp.float32)
     K_fit = Init_K(K_fit, N, INIT_K0=0.5)
     
     print("\nStarting optimization...")
