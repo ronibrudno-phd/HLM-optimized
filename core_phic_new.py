@@ -356,10 +356,9 @@ if __name__ == '__main__':
     decay=0.3,
     min_eta=1e-8,
     max_decays=5,
-    enable_jitter_restart=True,
-    jitter_after_decays=2,
-    jitter_sigma=1e-3,
+    enable_jitter_restart=False,  # <-- important
 )
+
     opt_time = time.time() - start_opt
     print(f"\nOptimization completed in {opt_time:.2f}s ({opt_time/3600:.2f} hours)")
 
