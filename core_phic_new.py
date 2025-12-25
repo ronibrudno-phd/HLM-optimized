@@ -194,8 +194,13 @@ def phic2_optimized(
             cp.subtract(P_buf, P_obs, out=P_buf)
             cost_new = Pdif2cost(P_buf, N)
             cost_new_f = float(cost_new)
-
-            bad = (not np.isfinite(cost_new_f)) or (cost_new_f > max_jump_factor * cost_prev)
+            
+                        # Reject if non-finite OR if it increases cost beyond a tiny tolerance
+            tol_increase = 1e-6  # allow 0.0001% increases (noise)
+            bad = (
+                (not np.isfinite(cost_new_f)) or
+                (cost_new_f > cost_prev * (1.0 + tol_increase))
+            )
 
             if bad:
                 retry += 1
@@ -310,7 +315,8 @@ if __name__ == '__main__':
        # Stable starter settings for N~28k
     ETA0   = 1e-06          # safer than 1e-6 (you already saw one huge spike)
     ITERS0 = 100            # enough to see a trend; rollback protects you
-    
+    print("\nStarting optimization...")
+    start_opt = time.time()
     K_fit, c_traj, paras_fit = phic2_optimized(
         K_fit,
         P_obs,
@@ -322,7 +328,7 @@ if __name__ == '__main__':
         k_max=10.0,               # keep for now; only increase if progress stalls
         print_every_sec=10,
         max_jump_factor=5.0,      # stricter: reject big blow-ups early
-        max_retries=2,
+        max_retries=3,
     )
 
     opt_time = time.time() - start_opt
