@@ -340,7 +340,7 @@ if __name__ == '__main__':
          # Stable starter settings for N~28k
        
     ETA0 = 1e-6
-    ITERS0 = 500
+    ITERS0 = 1000
     
     print("\nStarting optimization (phase 1)...")
     start_opt = time.time()
@@ -352,10 +352,10 @@ if __name__ == '__main__':
     checkpoint_interval=100,
     eps_diag=1e-6,
     k_max=10.0,
-    patience=10,
-    decay=0.3,
+    patience=20,
+    decay=0.5,
     min_eta=1e-8,
-    max_decays=5,
+    max_decays=8,
     enable_jitter_restart=False,  # <-- important
 )
 
