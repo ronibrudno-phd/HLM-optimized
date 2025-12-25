@@ -43,7 +43,7 @@ def K2P(K, G_buffer, identity):
     
     # Use solve() instead of inv() - much faster
     # Solve L[1:N,1:N] @ Q = I for Q
-    Q = solve(L[1:N, 1:N], identity, assume_a='pos')
+    Q = solve(L[1:N, 1:N], identity)
     M = 0.5 * (Q + Q.T)
     A = cp.diag(M)
     
@@ -62,7 +62,7 @@ def Pdif2cost(P_dif):
     return cost
 
 # OPTIMIZATION 3: Adaptive learning rate with momentum
-def phic2_optimized(K, ETA=1.0e-4, ALPHA=1.0e-4, ITERATION_MAX=10000,
+def phic2_optimized(K, ETA=1.0e-4, ALPHA=1.0e-4, ITERATION_MAX=1000000,
                    checkpoint_interval=1000, patience=100):
     """
     Optimized PHi-C2 with:
@@ -75,12 +75,12 @@ def phic2_optimized(K, ETA=1.0e-4, ALPHA=1.0e-4, ITERATION_MAX=10000,
     paras_fit = "%e\t%e\t%d\t" % (ETA, ALPHA, ITERATION_MAX)
     
     # Preallocate buffers
-    G_buffer = cp.zeros((N, N), dtype=cp.float32)
-    identity = cp.eye(N-1, dtype=cp.float32)
-    P_dif = cp.zeros((N, N), dtype=cp.float32)
+    G_buffer = cp.zeros((N, N))
+    identity = cp.eye(N-1)
+    P_dif = cp.zeros((N, N))
     
     # Momentum buffer
-    velocity = cp.zeros_like(K, dtype=cp.float32)
+    velocity = cp.zeros_like(K)
     momentum = 0.9
     
     # Adaptive learning rate
@@ -155,7 +155,7 @@ def phic2_optimized(K, ETA=1.0e-4, ALPHA=1.0e-4, ITERATION_MAX=10000,
             print(f"Checkpoint saved at iteration {iteration}, cost={float(cost):.6e}")
         
         # Stopping criteria
-        converged = (0 < cost_dif < stop_delta) and (iteration > 1000)
+        converged = (0 < cost_dif < stop_delta)
         max_iter_reached = (iteration == ITERATION_MAX)
         diverged = cp.isnan(cost)
         early_stop = (patience_counter > patience)
@@ -218,7 +218,7 @@ if __name__ == '__main__':
     # OPTIMIZATION 4: Use numpy.loadtxt for faster reading
     try:
         P_obs_np = np.loadtxt(fhic, comments='#')
-        P_obs = cp.array(P_obs_np, dtype=cp.float32)
+        P_obs = cp.array(P_obs_np)
     except:
         # Fallback to original method
         P_obs = []
@@ -227,14 +227,14 @@ if __name__ == '__main__':
                 if not line[0] == '#':
                     lt = line.strip().split()
                     P_obs.append(list(map(float, lt)))
-        P_obs = cp.array(P_obs, dtype=cp.float32)
+        P_obs = cp.array(P_obs)
     
     N = len(P_obs)
     print(f"Matrix size: N={N} ({N}x{N} = {N*N:,} elements)")
     print(f"Read time: {time.time()-start_read:.2f}s")
     
     cp.nan_to_num(P_obs, copy=False)  # Replace NaN with 0
-    P_obs = P_obs + cp.eye(N)    # Add identity (diagonal becomes 1.0)
+    P_obs = P_obs + cp.eye(N)  # Set p_ii = 1
     
     # Create output directory
     phic2_alpha = 1.0e-10
@@ -243,7 +243,7 @@ if __name__ == '__main__':
     
     # Minimization
     print("\nInitializing K matrix...")
-    K_fit = cp.zeros((N, N), dtype=cp.float32)
+    K_fit = cp.zeros((N, N))
     K_fit = Init_K(K_fit, N, INIT_K0=0.5)
     
     print("\nStarting optimization...")
@@ -251,7 +251,7 @@ if __name__ == '__main__':
     
     K_fit, c_traj, paras_fit = phic2_optimized(
         K_fit,
-        ETA=1e-4,
+        ETA=1.0e-4,
         ALPHA=phic2_alpha,
         ITERATION_MAX=1000000,
         checkpoint_interval=5000,
