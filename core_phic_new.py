@@ -9,7 +9,12 @@ import numpy as np
 from scipy.stats import pearsonr
 
 # IMPORTANT: use cupyx.scipy.linalg.solve to get assume_a='pos'
-from cupyx.scipy.linalg import solve
+try:
+    from cupyx.scipy.linalg import solve  # may not exist in your CuPy
+    _SOLVE_SUPPORTS_ASSUME_A = True
+except Exception:
+    from cupy.linalg import solve
+    _SOLVE_SUPPORTS_ASSUME_A = False
 
 cp.set_printoptions(precision=3, linewidth=200)
 warnings.filterwarnings('ignore')
@@ -47,7 +52,10 @@ def K2P_inplace(K, out_P, identity):
     L11[idx, idx] += d[1:]
 
     # Solve L11 @ Q = I  (Cholesky path because assume_a='pos')
-    Q = solve(L11, identity, assume_a='pos')  # (N-1)x(N-1)
+   if _SOLVE_SUPPORTS_ASSUME_A:
+    Q = solve(L11, identity, assume_a='pos')
+   else:
+    Q = solve(L11, identity)  # fallback (no assume_a)  # (N-1)x(N-1)
 
     # diag(Q)
     A = cp.diagonal(Q)
