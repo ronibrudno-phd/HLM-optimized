@@ -124,49 +124,39 @@ def phic2_stable(
     P_obs,
     ETA=1e-6,
     ALPHA=1e-10,
-    ITERATION_MAX=200,
+    ITERATION_MAX=500,
     checkpoint_interval=0,
     eps_diag=1e-6,
     k_max=10.0,
     print_every_sec=10,
-    patience=10,            # NEW: stop after this many non-improving iters
-    keep_best=True,         # NEW: restore best K on stop
+    patience=10,
+    keep_best=True,
+    decay=0.3,          # NEW: reduce ETA by this factor on plateau
+    min_eta=1e-8,        # NEW: don't go below this
+    max_decays=5,        # NEW: stop after this many decays
 ):
-    """
-    Original-style fixed-ETA gradient descent:
-      K <- K - ETA * P_dif
-
-    Stability guards for large N:
-      - projection of K (symmetric, nonnegative, capped)
-      - diagonal jitter in L11 (eps_diag)
-      - in-place K2P and P_dif buffer reuse
-
-    NEW:
-      - keeps best K and early-stops if no improvement for `patience` iters
-    """
     N = K.shape[0]
     stop_delta = ETA * ALPHA
     paras_fit = "%e\t%e\t%d\t" % (ETA, ALPHA, ITERATION_MAX)
 
-    # Reused buffers
-    P_buf = cp.empty((N, N), dtype=cp.float32)          # holds P then overwritten with P_dif
+    P_buf = cp.empty((N, N), dtype=cp.float32)
     identity = cp.eye(N - 1, dtype=cp.float32)
 
-    # Initial cost
     K2P_inplace(K, P_buf, identity, eps_diag=eps_diag)
-    cp.subtract(P_buf, P_obs, out=P_buf)                # now P_buf is P_dif
+    cp.subtract(P_buf, P_obs, out=P_buf)
     cost = Pdif2cost(P_buf, N)
 
-    # trajectory on CPU: [cost, time]
-    c_traj = np.zeros((ITERATION_MAX + 1, 2), dtype=np.float64)
+    c_traj = np.zeros((ITERATION_MAX + 1, 3), dtype=np.float64)
+    # columns: cost, time, eta_used
     c_traj[0, 0] = float(cost)
     c_traj[0, 1] = time.time()
+    c_traj[0, 2] = float(ETA)
 
-    # NEW: best tracking
     best_cost = float(cost)
     best_iter = 0
     best_K = K.copy() if keep_best else None
     worse_count = 0
+    decays_used = 0
 
     print(f"Starting optimization with N={N}, ETA={ETA:g}, ALPHA={ALPHA:g}")
     print(f"Initial cost: {float(cost):.6e}")
@@ -177,24 +167,26 @@ def phic2_stable(
     for iteration in range(1, ITERATION_MAX + 1):
         cost_bk = cost
 
-        # Gradient step (original method)
+        # Fixed-step update (but ETA may be reduced on plateau)
         K -= cp.float32(ETA) * P_buf
-
-        # Stability projection
         project_K_inplace(K, k_max=k_max)
 
-        # Recompute P_dif in-place
         K2P_inplace(K, P_buf, identity, eps_diag=eps_diag)
         cp.subtract(P_buf, P_obs, out=P_buf)
         cost = Pdif2cost(P_buf, N)
 
-        c_traj[iteration, 0] = float(cost)
-        c_traj[iteration, 1] = time.time()
-
         cost_f = float(cost)
         cost_dif = float(cost_bk - cost)
 
-        # NEW: best tracking + patience stop
+        c_traj[iteration, 0] = cost_f
+        c_traj[iteration, 1] = time.time()
+        c_traj[iteration, 2] = float(ETA)
+
+        if not np.isfinite(cost_f):
+            print(f"Diverged (non-finite cost) at iteration {iteration}")
+            break
+
+        # Best tracking
         if cost_f < best_cost:
             best_cost = cost_f
             best_iter = iteration
@@ -203,24 +195,26 @@ def phic2_stable(
                 best_K = K.copy()
         else:
             worse_count += 1
-            if worse_count >= patience:
-                print(f"Early stopping: no improvement for {patience} iters. "
-                      f"Best at iter {best_iter} cost={best_cost:.6e}")
+
+        # Plateau logic: reduce ETA and continue
+        if worse_count >= patience:
+            if ETA <= min_eta or decays_used >= max_decays:
+                print(f"Stopping: plateau persists. Best at iter {best_iter} cost={best_cost:.6e}")
                 if keep_best and best_K is not None:
                     K = best_K
                 break
+            ETA = max(ETA * decay, min_eta)
+            decays_used += 1
+            worse_count = 0
+            print(f"Plateau: reducing ETA -> {ETA:.2e} (decay {decays_used}/{max_decays})")
 
-        # Print progress
         now = time.time()
         if (now - last_print_time) > print_every_sec or iteration == 1 or iteration % 10 == 0:
             elapsed = now - c_traj[0, 1]
             print(f"{iteration}\t{cost_f:.6e}\t{cost_dif:+.3e}\t{ETA:.1e}\t{elapsed:6.1f}")
             last_print_time = now
 
-        # Stop conditions (same spirit as original)
-        if not np.isfinite(cost_f):
-            print(f"Diverged (non-finite cost) at iteration {iteration}")
-            break
+        # Optional convergence check
         if (0 < cost_dif < stop_delta) and (iteration > 3):
             print(f"Converged (stop_delta) at iteration {iteration}")
             break
@@ -235,6 +229,7 @@ def phic2_stable(
 
     c_traj = c_traj[: iteration + 1]
     return K, c_traj, paras_fit
+
 
 
 
@@ -289,23 +284,25 @@ if __name__ == '__main__':
     Init_K(K_fit, N, INIT_K0=0.5)
 
          # Stable starter settings for N~28k
-    ETA0   = 1e-6      # NOT 1e-4 (that will almost certainly blow up)
-    ITERS0 = 200
+       
+    ETA0 = 1e-6
+    ITERS0 = 500
     
+    print("\nStarting optimization (phase 1)...")
+    start_opt = time.time()
     K_fit, c_traj, paras_fit = phic2_stable(
-        K_fit,
-        P_obs,
+        K_fit, P_obs,
         ETA=ETA0,
         ALPHA=phic2_alpha,
         ITERATION_MAX=ITERS0,
-        checkpoint_interval=50,
+        checkpoint_interval=100,
         eps_diag=1e-6,
         k_max=10.0,
-        print_every_sec=10,
-        patience=10,        # add this
-        keep_best=True,     # add this
+        patience=10,
+        decay=0.3,
+        min_eta=1e-8,
+        max_decays=5,
     )
-
     opt_time = time.time() - start_opt
     print(f"\nOptimization completed in {opt_time:.2f}s ({opt_time/3600:.2f} hours)")
 
