@@ -7,6 +7,38 @@ import numpy as np
 
 # Optional: only used for small N; kept for compatibility
 from scipy.stats import pearsonr
+def pearson_sample(P_fit_gpu, P_obs_gpu, n_samples=1_000_000, seed=0):
+    """
+    Estimates:
+      p1 = Pearson(P_fit, P_obs) over sampled upper-triangle pairs
+      p2 = Pearson(P_fit, P_obs) over sampled upper-triangle pairs where P_obs > 0
+    """
+    rng = np.random.default_rng(seed)
+    N = int(P_obs_gpu.shape[0])
+
+    # sample upper-triangle indices on CPU
+    i = rng.integers(0, N - 1, size=n_samples, dtype=np.int32)
+    j = rng.integers(i + 1, N, size=n_samples, dtype=np.int32)
+
+    # move indices to GPU for gather
+    i_gpu = cp.asarray(i)
+    j_gpu = cp.asarray(j)
+
+    # gather sampled entries to CPU
+    obs = cp.asnumpy(P_obs_gpu[i_gpu, j_gpu])
+    fit = cp.asnumpy(P_fit_gpu[i_gpu, j_gpu])
+
+    # p1: all sampled
+    p1 = float(np.corrcoef(fit, obs)[0, 1])
+
+    # p2: sampled where obs>0
+    m = obs > 0
+    nz = int(m.sum())
+    p2 = float(np.corrcoef(fit[m], obs[m])[0, 1]) if nz >= 1000 else float("nan")
+
+    # free GPU temps
+    del i_gpu, j_gpu
+    return p1, p2, nz
 
 cp.set_printoptions(precision=3, linewidth=200)
 warnings.filterwarnings('ignore')
@@ -373,4 +405,35 @@ if __name__ == '__main__':
     print(f"N={N} too large: skipping P_fit + Pearson mask evaluation.")
     print("Saved: K_fit.npy and log only.")
     print(f"\nResults saved to {dataDir}")
+        # ---- Pearson check (sample-based; feasible for N~28k) ----
+    print("\nEstimating Pearson correlations by sampling...")
+
+    clear_cupy_pools()
+
+    # Allocate buffer for P_fit on GPU (NxN)
+    P_fit_gpu = cp.empty((N, N), dtype=cp.float32)
+
+    # Identity (N-1)x(N-1). If you already have one from training, reuse it.
+    identity_eval = cp.eye(N - 1, dtype=cp.float32)
+
+    print("Computing P_fit on GPU (one-time)...")
+    K2P_inplace(K_fit, P_fit_gpu, identity_eval, eps_diag=1e-6)
+
+    # Sample Pearson (increase n_samples for more stable estimate)
+    p1, p2, nz = pearson_sample(P_fit_gpu, P_obs, n_samples=1_000_000, seed=0)
+    print(f"Sample Pearson p1 (upper triangle): {p1:.6f}")
+    print(f"Sample Pearson p2 (obs>0):          {p2:.6f}   (nz samples={nz:,})")
+
+    # Save metrics
+    with open(f"{fo}.pearson_sample.txt", "w") as fw:
+        fw.write(f"N {N}\n")
+        fw.write("n_samples 1000000\n")
+        fw.write(f"p1_upper_triangle {p1:.8f}\n")
+        fw.write(f"p2_obs_gt_0 {p2:.8f}\n")
+        fw.write(f"nz_samples {nz}\n")
+
+    # Free eval buffers
+    del P_fit_gpu, identity_eval
+    clear_cupy_pools()
+
     print("Done!")
