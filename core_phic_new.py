@@ -269,7 +269,7 @@ if __name__ == '__main__':
         ALPHA=phic2_alpha,
         ITERATION_MAX=ITERS0,
         checkpoint_interval=50,
-        eps_diag=1e-6,
+        eps_diag=1e-4,
         k_max=10.0,
         print_every_sec=10,
         )
