@@ -439,7 +439,7 @@ if __name__ == '__main__':
         keep_best=True,
         decay=0.5,
         min_eta=1e-8,
-        max_decays=8,
+        max_decays=5,
         enable_jitter_restart=False,
         rc2=2,  # --- NEW: step acceptance / backtracking ---
         max_ls=20,
@@ -447,7 +447,7 @@ if __name__ == '__main__':
         ls_grow=1.0,
         accept_tol_rel=5e-5,
         accept_tol_abs=1e-8,
-        improve_tol=1e-10,
+        improve_tol=0.0,
         max_fail_iters=5,
 
     )
