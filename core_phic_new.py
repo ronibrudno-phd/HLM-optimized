@@ -125,14 +125,15 @@ def project_K_inplace(K, k_max=None):
     return K
 
 
+# ---------- Optimizer (stable + correct backtracking) ----------
 def phic2_stable(
     K,
     P_obs,
-    ETA=1e-7,
+    ETA=1e-7,             # recommended default for N~28k with backtracking
     ALPHA=1e-10,
     ITERATION_MAX=500,
     checkpoint_interval=0,
-    eps_diag=1e-5,
+    eps_diag=1e-6,
     k_max=None,
     print_every_sec=10,
     patience=20,
@@ -140,7 +141,7 @@ def phic2_stable(
     decay=0.5,
     min_eta=1e-10,
     max_decays=8,
-    enable_jitter_restart=True,
+    enable_jitter_restart=False,
     jitter_after_decays=2,
     jitter_sigma=1e-3,
     rc2=2.0,
@@ -153,7 +154,7 @@ def phic2_stable(
     improve_tol=1e-10,
     max_fail_iters=5,
 ):
-   """
+    """
     Key fix vs your current version:
       - Uses TWO NxN buffers:
           G_step : gradient proxy P_dif at current accepted K (used for proposing steps)
