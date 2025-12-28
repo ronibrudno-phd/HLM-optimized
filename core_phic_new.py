@@ -77,37 +77,22 @@ def clear_cupy_pools():
 
 
 # ---------- Core math (memory-lean, stabilized) ----------
-def K2P_inplace(K, out_P, identity, eps_diag=1e-6, rc2 =1.0):
-    """
-    Convert K -> P, writing P into out_P (NxN float32 buffer).
-    Stabilized:
-      - build only L11 (no full L)
-      - diagonal jitter on L11 for SPD stability
-      - guard base of power to avoid NaNs
-    """
+def K2P_inplace(K, out_P, identity, eps_diag=1e-6, rc2=1.0):
     N = K.shape[0]
-
-    # Degree vector (float32)
     d = cp.sum(K, axis=0, dtype=cp.float32)
 
-    # Build L11 = diag(d[1:]) - K[1:,1:] without building full L
-    L11 = (-K[1:, 1:]).copy()  # (N-1)x(N-1)
+    L11 = (-K[1:, 1:]).copy()
     idx = cp.arange(N - 1, dtype=cp.int32)
     L11[idx, idx] += d[1:]
-
-    # Diagonal regularization (prevents borderline non-SPD / ill-conditioning)
     L11[idx, idx] += cp.float32(eps_diag)
 
-    # Solve L11 @ Q = I
     if _SOLVE_SUPPORTS_ASSUME_A:
         Q = _solve(L11, identity, assume_a='pos')
     else:
         Q = _solve(L11, identity)
 
-    # diag(Q)
     A = cp.diagonal(Q)
 
-    # Fill out_P with G (reuse buffer)
     out_P.fill(0)
     sub = out_P[1:N, 1:N]
     sub[...] = -2.0 * Q
@@ -116,17 +101,12 @@ def K2P_inplace(K, out_P, identity, eps_diag=1e-6, rc2 =1.0):
     out_P[0, 1:N] = A
     out_P[1:N, 0] = A
 
-     # Convert G -> P in-place: P = (1 + 3G/rc2)^(-1.5)
+    # (1 + 3G/rc2)^(-1.5)
     out_P *= cp.float32(3.0 / rc2)
     out_P += cp.float32(1.0)
     cp.maximum(out_P, cp.float32(1e-6), out=out_P)
     cp.power(out_P, cp.float32(-1.5), out=out_P)
-    
-    # Guard to prevent negative/zero base -> NaNs/inf
-    cp.maximum(out_P, cp.float32(1e-6), out=out_P)
-    cp.power(out_P, cp.float32(-1.5), out=out_P)
 
-    # Free big temporaries
     del Q, L11, A, sub, d
     return out_P
 
@@ -137,17 +117,9 @@ def Pdif2cost(P_dif, N):
 
 
 def project_K_inplace(K, k_max=None):
-    """
-    Project K to a "safer" space:
-      - symmetric
-      - nonnegative
-      - capped (prevents blow-ups)
-    """
-    # Symmetrize
     K[...] = cp.float32(0.5) * (K + K.T)
-    # Nonnegative
     cp.maximum(K, cp.float32(0.0), out=K)
-    # Cap
+    cp.fill_diagonal(K, cp.float32(0.0))
     if k_max is not None:
         cp.minimum(K, cp.float32(k_max), out=K)
     return K
@@ -160,7 +132,7 @@ def phic2_stable(
     ALPHA=1e-10,
     ITERATION_MAX=500,
     checkpoint_interval=0,
-    eps_diag=1e-6,
+    eps_diag=1e-5,
     k_max=None,
     print_every_sec=10,
     patience=10,
@@ -172,6 +144,7 @@ def phic2_stable(
     enable_jitter_restart=True,
     jitter_after_decays=2,        # start jittering after this many decays
     jitter_sigma=1e-3,            # try 1e-4..1e-2 if needed
+    rc2= 0.5
 ):
     """
     Original-style fixed-step gradient descent with two plateau escapes:
@@ -193,7 +166,7 @@ def phic2_stable(
     identity = cp.eye(N - 1, dtype=cp.float32)
 
     # Initial cost + initial gradient (P_dif in P_buf)
-    K2P_inplace(K, P_buf, identity, eps_diag=eps_diag, rc2=0.5)
+    K2P_inplace(K, P_buf, identity, eps_diag=eps_diag, rc2=rc2)
     cp.subtract(P_buf, P_obs, out=P_buf)                # now P_buf is P_dif
     cost = Pdif2cost(P_buf, N)
 
@@ -223,13 +196,19 @@ def phic2_stable(
         project_K_inplace(K, k_max=k_max)
 
         # Recompute P_dif in-place
-        K2P_inplace(K, P_buf, identity, eps_diag=eps_diag, rc2=0.5)
+        K2P_inplace(K, P_buf, identity, eps_diag=eps_diag, rc2=rc2)
         cp.subtract(P_buf, P_obs, out=P_buf)
         cost = Pdif2cost(P_buf, N)
 
         cost_f = float(cost)
         cost_dif = float(cost_bk - cost)
-
+        if iteration % 50 == 0:
+        kmax = float(cp.max(K))
+        kmean = float(cp.mean(K))
+        print(f"   K stats: max={kmax:.3e} mean={kmean:.3e}")
+            if (not np.isfinite(kmax)) or (kmax > 1e6):
+                print("K exploded; stopping.")
+                break
         c_traj[iteration, 0] = cost_f
         c_traj[iteration, 1] = time.time()
         c_traj[iteration, 2] = float(ETA)
@@ -281,7 +260,7 @@ def phic2_stable(
                 did_restart = True
 
             # IMPORTANT: after restoring/restarting, recompute current gradient in P_buf
-            K2P_inplace(K, P_buf, identity, eps_diag=eps_diag, rc2=0.5)
+            K2P_inplace(K, P_buf, identity, eps_diag=eps_diag, rc2=rc2)
             cp.subtract(P_buf, P_obs, out=P_buf)
 
             if did_restart:
@@ -323,10 +302,13 @@ def phic2_stable(
 
 
 def saveLg(fn, xy, ct):
-    with open(fn, 'w') as fw:
+    with open(fn, "w") as fw:
         fw.write(ct)
         for row in xy:
-            fw.write(f"{row[0]:.5e} {row[1]:.5e}\n")
+            if row.shape[0] >= 3:
+                fw.write(f"{row[0]:.5e} {row[1]:.5e} {row[2]:.5e}\n")
+            else:
+                fw.write(f"{row[0]:.5e} {row[1]:.5e}\n")
 
 
 # ---------- Main ----------
@@ -392,6 +374,7 @@ if __name__ == '__main__':
         min_eta=1e-8,
         max_decays=8,
         enable_jitter_restart=False,
+        rc2=0.5
     )
 
     opt_time = time.time() - start_opt
@@ -413,7 +396,7 @@ if __name__ == '__main__':
     identity_eval = cp.eye(N - 1, dtype=cp.float32)
 
     print("Computing P_fit on GPU (one-time)...")
-    K2P_inplace(K_fit, P_fit_gpu, identity_eval, eps_diag=1e-6, rc2-0.5)
+    K2P_inplace(K_fit, P_fit_gpu, identity_eval, eps_diag=1e-6, rc2=0.5)
 
     p1, p2, nz = pearson_sample(P_fit_gpu, P_obs, n_samples=1_000_000, seed=0)
     print(f"Sample Pearson p1 (upper triangle): {p1:.6f}")
