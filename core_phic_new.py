@@ -77,7 +77,7 @@ def clear_cupy_pools():
 
 
 # ---------- Core math (memory-lean, stabilized) ----------
-def K2P_inplace(K, out_P, identity, eps_diag=1e-6):
+def K2P_inplace(K, out_P, identity, eps_diag=1e-6, rc2 =1.0):
     """
     Convert K -> P, writing P into out_P (NxN float32 buffer).
     Stabilized:
@@ -116,10 +116,12 @@ def K2P_inplace(K, out_P, identity, eps_diag=1e-6):
     out_P[0, 1:N] = A
     out_P[1:N, 0] = A
 
-    # Convert G -> P in-place: P = (1 + 3G)^(-1.5)
-    out_P *= cp.float32(3.0)
+     # Convert G -> P in-place: P = (1 + 3G/rc2)^(-1.5)
+    out_P *= cp.float32(3.0 / rc2)
     out_P += cp.float32(1.0)
-
+    cp.maximum(out_P, cp.float32(1e-6), out=out_P)
+    cp.power(out_P, cp.float32(-1.5), out=out_P)
+    
     # Guard to prevent negative/zero base -> NaNs/inf
     cp.maximum(out_P, cp.float32(1e-6), out=out_P)
     cp.power(out_P, cp.float32(-1.5), out=out_P)
@@ -134,7 +136,7 @@ def Pdif2cost(P_dif, N):
     return cp.sqrt(cp.sum(P_dif * P_dif)) / cp.float32(N)
 
 
-def project_K_inplace(K, k_max=10.0):
+def project_K_inplace(K, k_max=None):
     """
     Project K to a "safer" space:
       - symmetric
@@ -159,7 +161,7 @@ def phic2_stable(
     ITERATION_MAX=500,
     checkpoint_interval=0,
     eps_diag=1e-6,
-    k_max=10.0,
+    k_max=None,
     print_every_sec=10,
     patience=10,
     keep_best=True,
@@ -191,7 +193,7 @@ def phic2_stable(
     identity = cp.eye(N - 1, dtype=cp.float32)
 
     # Initial cost + initial gradient (P_dif in P_buf)
-    K2P_inplace(K, P_buf, identity, eps_diag=eps_diag)
+    K2P_inplace(K, P_buf, identity, eps_diag=eps_diag, rc2=0.5)
     cp.subtract(P_buf, P_obs, out=P_buf)                # now P_buf is P_dif
     cost = Pdif2cost(P_buf, N)
 
@@ -221,7 +223,7 @@ def phic2_stable(
         project_K_inplace(K, k_max=k_max)
 
         # Recompute P_dif in-place
-        K2P_inplace(K, P_buf, identity, eps_diag=eps_diag)
+        K2P_inplace(K, P_buf, identity, eps_diag=eps_diag, rc2=0.5)
         cp.subtract(P_buf, P_obs, out=P_buf)
         cost = Pdif2cost(P_buf, N)
 
@@ -279,7 +281,7 @@ def phic2_stable(
                 did_restart = True
 
             # IMPORTANT: after restoring/restarting, recompute current gradient in P_buf
-            K2P_inplace(K, P_buf, identity, eps_diag=eps_diag)
+            K2P_inplace(K, P_buf, identity, eps_diag=eps_diag, rc2=0.5)
             cp.subtract(P_buf, P_obs, out=P_buf)
 
             if did_restart:
@@ -356,7 +358,7 @@ if __name__ == '__main__':
 
     # Replace NaN/Inf with 0 and set diagonal to 1
     cp.nan_to_num(P_obs, copy=False)
-    P_obs += cp.eye(N, dtype=cp.float32)
+    cp.fill_diagonal(P_obs, 1.0)
 
     # Output directory
     phic2_alpha = 1.0e-10
@@ -366,7 +368,7 @@ if __name__ == '__main__':
     # Init K
     print("\nInitializing K matrix...")
     K_fit = cp.zeros((N, N), dtype=cp.float32)
-    Init_K(K_fit, N, INIT_K0=0.5)
+    Init_K(K_fit, N, INIT_K0=0.1)
 
     # Settings
     ETA0 = 1e-6
@@ -382,7 +384,7 @@ if __name__ == '__main__':
         ITERATION_MAX=ITERS0,
         checkpoint_interval=100,
         eps_diag=1e-6,
-        k_max=10.0,
+        k_max=None,
         print_every_sec=10,
         patience=20,
         keep_best=True,
@@ -411,7 +413,7 @@ if __name__ == '__main__':
     identity_eval = cp.eye(N - 1, dtype=cp.float32)
 
     print("Computing P_fit on GPU (one-time)...")
-    K2P_inplace(K_fit, P_fit_gpu, identity_eval, eps_diag=1e-6)
+    K2P_inplace(K_fit, P_fit_gpu, identity_eval, eps_diag=1e-6, rc2-0.5)
 
     p1, p2, nz = pearson_sample(P_fit_gpu, P_obs, n_samples=1_000_000, seed=0)
     print(f"Sample Pearson p1 (upper triangle): {p1:.6f}")
