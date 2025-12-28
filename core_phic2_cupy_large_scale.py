@@ -247,7 +247,7 @@ if True:
     print()
     
     start_opt = time.time()
-    K_fit, c_traj, paras_fit = phic2(K_fit, P_obs, ETA=1.0e-4, ALPHA=phic2_alpha, 
+    K_fit, c_traj, paras_fit = phic2(K_fit, P_obs, ETA=1.0e-6, ALPHA=phic2_alpha, 
                                      ITERATION_MAX=1000000, verbose=True)
     opt_time = time.time() - start_opt
     
