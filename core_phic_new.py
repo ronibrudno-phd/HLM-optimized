@@ -203,9 +203,9 @@ def phic2_stable(
         cost_f = float(cost)
         cost_dif = float(cost_bk - cost)
         if iteration % 50 == 0:
-        kmax = float(cp.max(K))
-        kmean = float(cp.mean(K))
-        print(f"   K stats: max={kmax:.3e} mean={kmean:.3e}")
+            kmax = float(cp.max(K))
+            kmean = float(cp.mean(K))
+            print(f"   K stats: max={kmax:.3e} mean={kmean:.3e}")
             if (not np.isfinite(kmax)) or (kmax > 1e6):
                 print("K exploded; stopping.")
                 break
