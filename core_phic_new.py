@@ -424,8 +424,6 @@ if __name__ == '__main__':
         accept_tol_rel=1e-8,
         accept_tol_abs=1e-10,
         improve_tol=0.0,
-        max_fail_iters=5,
-
     )
 
     opt_time = time.time() - start_opt
