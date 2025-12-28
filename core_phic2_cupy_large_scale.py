@@ -47,7 +47,7 @@ def print_memory_usage():
     gpu_mem = cp.get_default_memory_pool().used_bytes() / 1024**3
     gpu_total = cp.cuda.Device().mem_info[1] / 1024**3
     
-    print(f"Memory - CPU: {cpu_mem_gb:.2f}GB, GPU: {gpu_mem_gb:.2f}/{gpu_total:.2f}GB")
+    print(f"Memory - CPU: {cpu_mem_gb:.2f}GB, GPU: {gpu_mem:.2f}/{gpu_total:.2f}GB")
 
 def clear_gpu_memory():
     """Clear GPU memory cache"""
