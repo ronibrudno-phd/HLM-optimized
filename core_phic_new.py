@@ -144,7 +144,7 @@ def phic2_stable(
     enable_jitter_restart=True,
     jitter_after_decays=2,        # start jittering after this many decays
     jitter_sigma=1e-3,            # try 1e-4..1e-2 if needed
-    rc2= 0.5
+    rc2= 2
 ):
     """
     Original-style fixed-step gradient descent with two plateau escapes:
@@ -365,7 +365,7 @@ if __name__ == '__main__':
         ALPHA=phic2_alpha,
         ITERATION_MAX=ITERS0,
         checkpoint_interval=100,
-        eps_diag=1e-6,
+        eps_diag=1e-5,
         k_max=None,
         print_every_sec=10,
         patience=20,
@@ -374,7 +374,7 @@ if __name__ == '__main__':
         min_eta=1e-8,
         max_decays=8,
         enable_jitter_restart=False,
-        rc2=0.5
+        rc2=2
     )
 
     opt_time = time.time() - start_opt
@@ -396,7 +396,7 @@ if __name__ == '__main__':
     identity_eval = cp.eye(N - 1, dtype=cp.float32)
 
     print("Computing P_fit on GPU (one-time)...")
-    K2P_inplace(K_fit, P_fit_gpu, identity_eval, eps_diag=1e-6, rc2=0.5)
+    K2P_inplace(K_fit, P_fit_gpu, identity_eval, eps_diag=1e-5, rc2=2)
 
     p1, p2, nz = pearson_sample(P_fit_gpu, P_obs, n_samples=1_000_000, seed=0)
     print(f"Sample Pearson p1 (upper triangle): {p1:.6f}")
