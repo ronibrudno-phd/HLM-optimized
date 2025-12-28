@@ -77,7 +77,7 @@ def clear_cupy_pools():
 
 
 # ---------- Core math (memory-lean, stabilized) ----------
-def K2P_inplace(K, out_P, identity, eps_diag=1e-6, rc2=1.0):
+def K2P_inplace(K, out_P, identity, eps_diag=1e-5, rc2=2):
     N = K.shape[0]
     d = cp.sum(K, axis=0, dtype=cp.float32)
 
@@ -350,7 +350,7 @@ if __name__ == '__main__':
     # Init K
     print("\nInitializing K matrix...")
     K_fit = cp.zeros((N, N), dtype=cp.float32)
-    Init_K(K_fit, N, INIT_K0=0.1)
+    Init_K(K_fit, N, INIT_K0=0.5)
 
     # Settings
     ETA0 = 1e-6
@@ -372,7 +372,7 @@ if __name__ == '__main__':
         keep_best=True,
         decay=0.5,
         min_eta=1e-8,
-        max_decays=8,
+        max_decays=6,
         enable_jitter_restart=False,
         rc2=2
     )
