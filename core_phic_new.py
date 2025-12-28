@@ -137,40 +137,32 @@ def phic2_stable(
     print_every_sec=10,
     patience=10,
     keep_best=True,
-    decay=0.3,          # reduce ETA by this factor on plateau
-    min_eta=1e-8,        # don't go below this
-    max_decays=5,        # stop after this many decays
-    # ---- Solution 2 (optional restart) ----
+    decay=0.3,
+    min_eta=1e-8,
+    max_decays=5,
     enable_jitter_restart=True,
-    jitter_after_decays=2,        # start jittering after this many decays
-    jitter_sigma=1e-3,            # try 1e-4..1e-2 if needed
-    rc2= 2
+    jitter_after_decays=2,
+    jitter_sigma=1e-3,
+    rc2=2.0,
+    # --- NEW: step acceptance / backtracking ---
+    max_ls=8,            # max backtracking tries per iteration
+    ls_shrink=0.5,       # ETA *= ls_shrink on rejection
+    ls_grow=1.02,        # ETA *= ls_grow on acceptance (mild)
+    accept_tol=1e-8,     # allow tiny relative increase due to float noise
+    improve_tol=1e-10,   # treat smaller improvements as "no improvement" (for plateau)
 ):
-    """
-    Original-style fixed-step gradient descent with two plateau escapes:
-      1) On plateau: restore best_K BEFORE reducing ETA.
-      2) Optional: jitter restart around best_K after a few decays.
-
-    Requires:
-      - K2P_inplace(K, P_buf, identity, eps_diag=...)
-      - project_K_inplace(K, k_max=...)
-      - Pdif2cost(P_dif, N)
-      - clear_cupy_pools()
-    """
     N = K.shape[0]
     stop_delta = ETA * ALPHA
     paras_fit = "%e\t%e\t%d\t" % (ETA, ALPHA, ITERATION_MAX)
 
-    # Reused buffers
-    P_buf = cp.empty((N, N), dtype=cp.float32)          # holds P then overwritten with P_dif
+    P_buf = cp.empty((N, N), dtype=cp.float32)
     identity = cp.eye(N - 1, dtype=cp.float32)
 
-    # Initial cost + initial gradient (P_dif in P_buf)
+    # Initial P_dif + cost
     K2P_inplace(K, P_buf, identity, eps_diag=eps_diag, rc2=rc2)
-    cp.subtract(P_buf, P_obs, out=P_buf)                # now P_buf is P_dif
+    cp.subtract(P_buf, P_obs, out=P_buf)
     cost = Pdif2cost(P_buf, N)
 
-    # trajectory on CPU: [cost, time, eta_used]
     c_traj = np.zeros((ITERATION_MAX + 1, 3), dtype=np.float64)
     c_traj[0, 0] = float(cost)
     c_traj[0, 1] = time.time()
@@ -184,24 +176,60 @@ def phic2_stable(
 
     print(f"Starting optimization with N={N}, ETA={ETA:g}, ALPHA={ALPHA:g}")
     print(f"Initial cost: {float(cost):.6e}")
-    print("iter\tcost\t\tcost_diff\teta\t\tt(sec)")
+    print("iter\tcost\t\tcost_diff\teta\t\tt(sec)\tls")
 
     last_print_time = time.time()
 
+    eta = float(ETA)  # local step size controlled by backtracking
+
     for iteration in range(1, ITERATION_MAX + 1):
-        cost_bk = cost
+        cost_prev = float(cost)
+        cost_bk = cost  # cp scalar
+        K_prev = K.copy()
 
-        # Fixed-step update (ETA may be reduced on plateau)
-        K -= cp.float32(ETA) * P_buf
-        project_K_inplace(K, k_max=k_max)
+        # ----------------------------
+        # NEW: backtracking accept/reject
+        # ----------------------------
+        accepted = False
+        eta_try = eta
+        ls_used = 0
 
-        # Recompute P_dif in-place
-        K2P_inplace(K, P_buf, identity, eps_diag=eps_diag, rc2=rc2)
-        cp.subtract(P_buf, P_obs, out=P_buf)
-        cost = Pdif2cost(P_buf, N)
+        for ls in range(max_ls + 1):
+            ls_used = ls
+            # propose from the same K_prev
+            K[...] = K_prev
+            K -= cp.float32(eta_try) * P_buf
+            project_K_inplace(K, k_max=k_max)
+
+            # evaluate
+            K2P_inplace(K, P_buf, identity, eps_diag=eps_diag, rc2=rc2)
+            cp.subtract(P_buf, P_obs, out=P_buf)
+            cost_new = Pdif2cost(P_buf, N)
+            cost_new_f = float(cost_new)
+
+            bad = (not np.isfinite(cost_new_f)) or (cost_new_f > cost_prev * (1.0 + accept_tol))
+            if not bad:
+                cost = cost_new
+                accepted = True
+                break
+
+            # reject: shrink eta and retry
+            eta_try *= ls_shrink
+
+        if not accepted:
+            # rollback + stop (or you can continue with smaller eta; stopping is safer)
+            K[...] = K_prev
+            cost = cp.float32(cost_prev)
+            print(f"Line-search failed at iter {iteration}; eta_try={eta_try:.2e}. Stopping.")
+            break
+
+        # accept: mildly grow eta for next iter, but cap by original ETA
+        eta = min(max(eta_try * ls_grow, min_eta), float(ETA))
 
         cost_f = float(cost)
         cost_dif = float(cost_bk - cost)
+
+        # stats / logging
         if iteration % 50 == 0:
             kmax = float(cp.max(K))
             kmean = float(cp.mean(K))
@@ -209,16 +237,13 @@ def phic2_stable(
             if (not np.isfinite(kmax)) or (kmax > 1e6):
                 print("K exploded; stopping.")
                 break
+
         c_traj[iteration, 0] = cost_f
         c_traj[iteration, 1] = time.time()
-        c_traj[iteration, 2] = float(ETA)
+        c_traj[iteration, 2] = float(eta_try)  # actual step used
 
-        if not np.isfinite(cost_f):
-            print(f"Diverged (non-finite cost) at iteration {iteration}")
-            break
-
-        # Best tracking
-        if cost_f < best_cost:
+        # Best tracking with tolerance (prevents plateau triggers from float noise)
+        if cost_f < best_cost - improve_tol:
             best_cost = cost_f
             best_iter = iteration
             worse_count = 0
@@ -227,30 +252,24 @@ def phic2_stable(
         else:
             worse_count += 1
 
-        # ----------------------------
-        # Solution 1 + Solution 2:
-        # Plateau logic: restore best_K, reduce ETA, optional jitter restart
-        # ----------------------------
+        # Plateau logic (kept, but now it’s about true plateau, not uphill steps)
         if worse_count >= patience:
-            # Always jump back to the best-known basin before changing ETA
             if keep_best and best_K is not None:
                 K = best_K.copy()
 
-            # Stop if we can't/shouldn't decay further
-            if ETA <= min_eta or decays_used >= max_decays:
+            if eta <= min_eta or decays_used >= max_decays:
                 print(f"Stopping: plateau persists. Best at iter {best_iter} cost={best_cost:.6e}")
                 if keep_best and best_K is not None:
                     K = best_K
                 break
 
-            # Reduce ETA
+            # reduce BOTH ETA (cap) and local eta
             ETA = max(ETA * decay, min_eta)
+            eta = min(eta, float(ETA))
             decays_used += 1
             worse_count = 0
 
             did_restart = False
-
-            # Optional: jitter restart around best_K after a few decays
             if enable_jitter_restart and (decays_used >= jitter_after_decays) and keep_best and (best_K is not None):
                 sigma = cp.float32(jitter_sigma)
                 noise = sigma * cp.random.standard_normal(K.shape, dtype=cp.float32)
@@ -259,7 +278,7 @@ def phic2_stable(
                 project_K_inplace(K, k_max=k_max)
                 did_restart = True
 
-            # IMPORTANT: after restoring/restarting, recompute current gradient in P_buf
+            # refresh P_buf for the restored/restarted K
             K2P_inplace(K, P_buf, identity, eps_diag=eps_diag, rc2=rc2)
             cp.subtract(P_buf, P_obs, out=P_buf)
 
@@ -272,10 +291,10 @@ def phic2_stable(
         now = time.time()
         if (now - last_print_time) > print_every_sec or iteration == 1 or iteration % 10 == 0:
             elapsed = now - c_traj[0, 1]
-            print(f"{iteration}\t{cost_f:.6e}\t{cost_dif:+.3e}\t{ETA:.1e}\t{elapsed:6.1f}")
+            print(f"{iteration}\t{cost_f:.6e}\t{cost_dif:+.3e}\t{eta_try:.1e}\t{elapsed:6.1f}\t{ls_used}")
             last_print_time = now
 
-        # Optional convergence check (same spirit as original)
+        # Optional convergence check
         if (0 < cost_dif < stop_delta) and (iteration > 3):
             print(f"Converged (stop_delta) at iteration {iteration}")
             break
@@ -290,7 +309,6 @@ def phic2_stable(
 
     c_traj = c_traj[: iteration + 1]
 
-    # Ensure we return best_K if requested (even if loop ended without plateau stop)
     if keep_best and best_K is not None:
         K = best_K
 
@@ -368,13 +386,19 @@ if __name__ == '__main__':
         eps_diag=1e-5,
         k_max=None,
         print_every_sec=10,
-        patience=20,
+        patience=30,
         keep_best=True,
         decay=0.5,
         min_eta=1e-8,
         max_decays=6,
         enable_jitter_restart=False,
-        rc2=2
+        rc2=2,  # --- NEW: step acceptance / backtracking ---
+        max_ls=8,            # max backtracking tries per iteration
+        ls_shrink=0.5,       # ETA *= ls_shrink on rejection
+        ls_grow=1.02,        # ETA *= ls_grow on acceptance (mild)
+        accept_tol=1e-8,     # allow tiny relative increase due to float noise
+        improve_tol=1e-10  # treat smaller improvements as "no improvement" (for plateau)
+
     )
 
     opt_time = time.time() - start_opt
