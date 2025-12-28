@@ -408,6 +408,14 @@ if __name__ == '__main__':
     # Replace NaN/Inf with 0 and set diagonal to 1
     cp.nan_to_num(P_obs, copy=False)
     cp.fill_diagonal(P_obs, 1.0)
+    adj = cp.asnumpy(P_obs.diagonal(1))
+    adj = adj[np.isfinite(adj)]
+    print("P_obs diag+1 stats:",
+      "mean", adj.mean(),
+      "median", np.median(adj),
+      "p10", np.quantile(adj, 0.10),
+      "p90", np.quantile(adj, 0.90),
+      "max", adj.max())
 
     # Output directory
     phic2_alpha = 1.0e-10
