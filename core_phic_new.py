@@ -412,7 +412,7 @@ if __name__ == '__main__':
     Init_K(K_fit, N, INIT_K0=0.5)
 
     # Settings
-    ETA0 = 1e-7
+    ETA0 = 1e-6
     ITERS0 = 1000  # you used 500 in the call; keep consistent
 
     print("\nStarting optimization...")
@@ -427,18 +427,18 @@ if __name__ == '__main__':
         eps_diag=1e-5,
         k_max=None,
         print_every_sec=10,
-        patience=20,
+        patience=100,
         keep_best=True,
         decay=0.5,
-        min_eta=1e-10,
+        min_eta=1e-8,
         max_decays=8,
         enable_jitter_restart=False,
         rc2=2,  # --- NEW: step acceptance / backtracking ---
         max_ls=20,
-        ls_shrink=0.5,
+        ls_shrink=0.7,
         ls_grow=1.02,
-        accept_tol_rel=1e-8,
-        accept_tol_abs=1e-10,
+        accept_tol_rel=1e-5,
+        accept_tol_abs=1e-8,
         improve_tol=1e-10,
         max_fail_iters=5,
 
