@@ -361,7 +361,7 @@ if __name__ == "__main__":
         ETA=INIT_ETA,
         ALPHA=1e-10,
         ITERATION_MAX=1000000,
-        BETA=0.9,
+        BETA=0.5,
         MIN_ETA=1e-10
     )
     opt_time = time.time() - start_opt
