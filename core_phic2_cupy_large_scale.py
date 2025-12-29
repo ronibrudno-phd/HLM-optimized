@@ -89,7 +89,7 @@ def cost_func(P_dif, N):
 def constrain_K(K):
     K = cp.maximum(K, 0)
     K = 0.5 * (K + K.T)
-    K = cp.minimum(K)
+    K = cp.minimum(K, 1e3)
     return K
 
 def estimate_eta(P_obs, K_init, N, identity, P_temp):
