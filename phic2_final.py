@@ -101,18 +101,24 @@ def K2P_inplace(K, out_P, identity, eps_diag=1e-5, rc2=1.0):
     del Q, L11, A, sub, d
     return out_P
 
-def constrain_K(K):
+def constrain_K(K, K_bound):
     """
     Apply physical constraints to K:
-    1. Symmetric (physical requirement - Newton's 3rd law)
-    2. NO non-negativity constraint (negative K = repulsion, biologically valid!)
-    3. Bounded magnitude to prevent numerical overflow
+    1. Symmetric (REQUIRED - Newton's 3rd law)
+    2. Bounded magnitude (prevents overflow, allows both attraction and repulsion)
+    
+    Args:
+        K: Spring constant matrix
+        K_bound: Maximum allowed |K| value
+    
+    Returns:
+        K_constrained
     """
     # Symmetric (REQUIRED)
     K = 0.5 * (K + K.T)
     
-    # Bound magnitude (prevent overflow, but allow negative)
-    K = cp.clip(K, -1e3, 1e3)
+    # Bound magnitude (allow negative for repulsion)
+    K = cp.clip(K, -K_bound, K_bound)
     
     return K
 
@@ -149,10 +155,23 @@ def phic2_final(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, ITE
     """
     Final production PHi-C2 with all optimizations
     """
+    # Determine K bound based on matrix size
+    # Empirical observation: K scales roughly as 1000 * (2869/N)
+    if N < 3000:
+        K_bound = 1000.0  # For ~1MB resolution (like paper)
+    elif N < 10000:
+        K_bound = 500.0   # For ~500KB resolution
+    elif N < 20000:
+        K_bound = 200.0   # For ~200KB resolution
+    else:
+        K_bound = 100.0   # For ~100KB resolution (your case)
+    
     print("\n" + "="*80)
     print("Starting PHi-C2 Optimization")
     print("="*80)
+    print(f"Matrix size: {N}×{N}")
     print(f"Initial ETA: {ETA_init:.2e}")
+    print(f"K bound: ±{K_bound:.1f} (adaptive based on matrix size)")
     print(f"Checkpoint directory: {checkpoint_dir}")
     print()
     
@@ -183,6 +202,7 @@ def phic2_final(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, ITE
     cost_history = [float(cost)]
     oscillation_count = 0
     eta_reduction_count = 0
+    k_bound_expansions = 0  # Track bound expansions
     
     last_print = time.time()
     last_checkpoint = 0
@@ -193,8 +213,23 @@ def phic2_final(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, ITE
         # Gradient descent
         K -= ETA * P_dif
         
-        # CRITICAL: Apply constraints
-        K = constrain_K(K)
+        # Check if K exceeds current bound BEFORE clipping
+        K_min = float(cp.min(K))
+        K_max = float(cp.max(K))
+        K_absmax = max(abs(K_min), abs(K_max))
+        
+        # Dynamic bound expansion if K naturally grew beyond current bound
+        if K_absmax > K_bound * 1.2:  # Allow 20% overflow before expanding
+            old_bound = K_bound
+            K_bound = K_absmax * 1.5  # Expand to 1.5× current max
+            k_bound_expansions += 1
+            
+            print(f"\n  → K_bound expanded at iteration {iteration}")
+            print(f"     K range: [{K_min:.2e}, {K_max:.2e}]")
+            print(f"     Bound: {old_bound:.1f} → {K_bound:.1f} (expansion #{k_bound_expansions})")
+        
+        # CRITICAL: Apply constraints with current K_bound
+        K = constrain_K(K, K_bound)
         
         # Check K health
         if cp.any(cp.isnan(K)) or cp.any(cp.isinf(K)):
@@ -261,10 +296,16 @@ def phic2_final(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, ITE
             rate = iteration / elapsed if elapsed > 0 else 0
             since_best = iteration - best_iter
             
+            # Current K statistics
+            K_curr_min = float(cp.min(K))
+            K_curr_max = float(cp.max(K))
+            
             print(f"Iter {iteration:7d} | Cost: {cost:.6e} | ΔCost: {cost_dif:+.6e} | "
                   f"Best: {best_cost:.6e} | ETA: {ETA:.2e}")
             print(f"  Rate: {rate:.2f} it/s | Time: {elapsed/60:.1f}m | "
-                  f"Since best: {since_best} | Reductions: {eta_reduction_count}")
+                  f"Since best: {since_best} | ETA reduct: {eta_reduction_count} | "
+                  f"K_bound expan: {k_bound_expansions}")
+            print(f"  K range: [{K_curr_min:.2e}, {K_curr_max:.2e}] | K_bound: ±{K_bound:.1f}")
             print_memory()
             
             last_print = time.time()
@@ -329,6 +370,8 @@ def phic2_final(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, ITE
     print(f"  Initial cost: {c_traj[0,0]:.6e}")
     print(f"  Improvement: {c_traj[0,0] - best_cost:.6e} ({100*(c_traj[0,0]-best_cost)/c_traj[0,0]:.2f}%)")
     print(f"  ETA reductions: {eta_reduction_count}")
+    print(f"  K_bound expansions: {k_bound_expansions}")
+    print(f"  Final K_bound: ±{K_bound:.1f}")
     print("="*80)
     
     paras_fit = f"{ETA_init}\t{ALPHA}\t{iteration}\t{eta_reduction_count}\t"
