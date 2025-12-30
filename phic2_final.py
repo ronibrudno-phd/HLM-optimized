@@ -457,8 +457,13 @@ if __name__ == "__main__":
     del P_temp, identity_temp
     gc.collect()
     
-    # Create output directory
-    dataDir = fhic[:fhic.rfind('.')] + "_phic2_FINAL"
+    # Create output directory using input filename
+    # Extract base filename without path and extension
+    input_basename = os.path.basename(fhic)  # e.g., "homsap_100Kb_GWKR_HLM_input.txt"
+    input_name = os.path.splitext(input_basename)[0]  # e.g., "homsap_100Kb_GWKR_HLM_input"
+    
+    # Create descriptive output directory
+    dataDir = f"{input_name}_phic2_FINAL"
     os.makedirs(dataDir, exist_ok=True)
     checkpoint_dir = f"{dataDir}/checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -543,12 +548,63 @@ if __name__ == "__main__":
            f"#P_fit N={N} range=[{np.nanmin(P_fit):.5e}, {np.nanmax(P_fit):.5e}] "
            f"pearson={p1:.6f} {p2:.6f}\n")
     
+    # Save comprehensive summary file
+    summary_file = f"{dataDir}/SUMMARY_{input_name}.txt"
+    with open(summary_file, 'w') as f:
+        f.write("="*80 + "\n")
+        f.write("PHi-C2 OPTIMIZATION SUMMARY\n")
+        f.write("="*80 + "\n\n")
+        f.write(f"Input file:                {os.path.basename(fhic)}\n")
+        f.write(f"Species/Sample:            {input_name}\n")
+        f.write(f"Date:                      {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write(f"Matrix size:               {N}×{N}\n")
+        f.write(f"Non-zero elements:         {nonzero:,} ({sparsity:.1f}% sparse)\n")
+        f.write(f"Resolution:                {input_name.split('_')[1] if '_' in input_name else 'Unknown'}\n\n")
+        f.write(f"Optimization:\n")
+        f.write(f"  Total time:              {total_time/60:.1f} min ({total_time/3600:.1f} hours)\n")
+        f.write(f"  Iterations:              {len(c_traj_np):,}\n")
+        f.write(f"  Initial cost:            {c_traj_np[0,0]:.6e}\n")
+        f.write(f"  Final cost:              {c_traj_np[-1,0]:.6e}\n")
+        f.write(f"  Improvement:             {100*(c_traj_np[0,0]-c_traj_np[-1,0])/c_traj_np[0,0]:.2f}%\n\n")
+        f.write(f"Results:\n")
+        f.write(f"  Pearson (all):           {p1:.6f}\n")
+        f.write(f"  Pearson (obs>0):         {p2:.6f}\n")
+        f.write(f"  K range:                 [{np.min(K_fit):.5e}, {np.max(K_fit):.5e}]\n")
+        f.write(f"  P range:                 [{np.nanmin(P_fit):.5e}, {np.nanmax(P_fit):.5e}]\n\n")
+        f.write(f"Output files:\n")
+        f.write(f"  K matrix:                {fo}.K_fit\n")
+        f.write(f"  P matrix:                {fo}.P_fit\n")
+        f.write(f"  Log file:                {fo}.log\n")
+        f.write(f"  Checkpoints:             {checkpoint_dir}/\n\n")
+        f.write("="*80 + "\n")
+        
+        # Quality interpretation
+        f.write("QUALITY ASSESSMENT:\n")
+        f.write("="*80 + "\n")
+        if p1 >= 0.90:
+            f.write("✓✓ EXCELLENT (Pearson > 0.90)\n")
+            f.write("   Highly successful optimization!\n")
+        elif p1 >= 0.85:
+            f.write("✓ GOOD (Pearson > 0.85)\n")
+            f.write("  Successful optimization, acceptable for most analyses.\n")
+        elif p1 >= 0.75:
+            f.write("△ ACCEPTABLE (Pearson > 0.75)\n")
+            f.write("  Usable results, consider coarser resolution for better fit.\n")
+        else:
+            f.write("✗ POOR (Pearson < 0.75)\n")
+            f.write("  Model may not fit well at this resolution.\n")
+            f.write("  Recommendation: Try 500KB or 1MB resolution.\n")
+        f.write("="*80 + "\n")
+    
+    print(f"  ✓ Saved summary: {summary_file}")
+    
     total_time = time.time() - start_total
     
     # Final summary
     print("\n" + "="*80)
     print("FINAL SUMMARY")
     print("="*80)
+    print(f"Input file:                {os.path.basename(fhic)}")
     print(f"Matrix:                    {N}×{N}")
     print(f"Total time:                {total_time/60:.1f} min ({total_time/3600:.1f} hours)")
     print(f"  - Loading:               {load_time:.1f}s")
