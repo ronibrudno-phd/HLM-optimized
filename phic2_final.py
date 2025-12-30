@@ -31,7 +31,7 @@ print("="*80)
 print("Features:")
 print("  ✓ Memory-optimized K2P (uses solve, not inv)")
 print("  ✓ Adaptive learning rate")
-print("  ✓ K constraints (non-negative, symmetric, bounded)")
+print("  ✓ K constraints: symmetric + bounded (negative K allowed for repulsion)")
 print("  ✓ Both fast sampling & full Pearson correlation")
 print("  ✓ Checkpointing every 100 iterations")
 print("="*80)
@@ -104,18 +104,15 @@ def K2P_inplace(K, out_P, identity, eps_diag=1e-5, rc2=1.0):
 def constrain_K(K):
     """
     Apply physical constraints to K:
-    1. Non-negative (no negative springs)
-    2. Symmetric (physical requirement)
-    3. Bounded (prevent numerical overflow)
+    1. Symmetric (physical requirement - Newton's 3rd law)
+    2. NO non-negativity constraint (negative K = repulsion, biologically valid!)
+    3. Bounded magnitude to prevent numerical overflow
     """
-    # Non-negative
-    K = cp.maximum(K, 0)
-    
-    # Symmetric
+    # Symmetric (REQUIRED)
     K = 0.5 * (K + K.T)
     
-    # Upper bound (prevent overflow)
-    K = cp.minimum(K, 1e3)
+    # Bound magnitude (prevent overflow, but allow negative)
+    K = cp.clip(K, -1e3, 1e3)
     
     return K
 
