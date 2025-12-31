@@ -24,8 +24,10 @@ Output:
 
 import os
 import sys
+import time
 import numpy as np
 from pathlib import Path
+from multiprocessing import Pool, cpu_count
 
 def read_K_matrix(fk):
     """Read K-matrix from file"""
@@ -75,69 +77,86 @@ def read_bin_info(fbin):
     
     return bins
 
-def generate_structure(K_fit, seed=None):
+def precompute_eigendecomposition(K_fit):
     """
-    Generate single structure using HLM eigenvalue sampling.
-    
-    This is the HLM-Genome method with fix for negative K values:
-    1. Compute Laplacian L = diag(d) - K
-    2. Eigendecompose: L = Q * Lambda * Q^T
-    3. Handle negative eigenvalues (from repulsive K values)
-    4. Sample X_i ~ N(0, 1/|lambda_i|) for i > 0
-    5. Transform: R = Q * X
+    Precompute eigendecomposition ONCE (expensive operation).
+    This is reused for all structure generations.
     """
-    if seed is not None:
-        np.random.seed(seed)
-    
     Ng = len(K_fit)
+    
+    print("  Computing eigendecomposition (one-time cost)...")
+    start = time.time()
     
     # K to Laplacian matrix
     d = np.sum(K_fit, axis=0) + np.diag(K_fit)
     Lap = np.diag(d) - K_fit
     
-    # Eigenvalues and eigenvectors
+    # Eigenvalues and eigenvectors (EXPENSIVE - do once!)
     lam, Qs = np.linalg.eigh(Lap)
     
-    # CRITICAL FIX: Handle negative eigenvalues
-    # Negative eigenvalues arise from repulsive interactions (negative K)
-    # We need to use absolute value for sqrt
-    lam_abs = np.abs(lam)
+    elapsed = time.time() - start
+    print(f"  ✓ Eigendecomposition complete in {elapsed:.1f}s")
     
-    # Also need minimum eigenvalue threshold to avoid division by very small numbers
-    # First eigenvalue should be ~0 (center of mass mode), but may be slightly negative
+    # Handle negative eigenvalues
+    lam_abs = np.abs(lam)
     min_eigenvalue = 1e-10
     lam_abs = np.maximum(lam_abs, min_eigenvalue)
     
-    # Report eigenvalue statistics (only for first structure to avoid spam)
+    # Report statistics
     num_negative = np.sum(lam < 0)
-    if num_negative > 0 and seed in [None, 1274]:
-        print(f"    Info: {num_negative}/{Ng} eigenvalues are negative (repulsive interactions)")
-        print(f"         Range: [{np.min(lam):.6e}, {np.max(lam):.6e}]")
+    if num_negative > 0:
+        print(f"  Info: {num_negative}/{Ng} eigenvalues are negative (repulsive interactions)")
+        print(f"        Range: [{np.min(lam):.6e}, {np.max(lam):.6e}]")
     
-    # Collective coordinates X
+    return lam_abs, Qs
+
+def generate_structure_fast(lam_abs, Qs):
+    """
+    Generate structure using PRECOMPUTED eigendecomposition.
+    This is MUCH faster - just sampling and matrix multiplication.
+    
+    Args:
+        lam_abs: Absolute eigenvalues (precomputed)
+        Qs: Eigenvectors (precomputed)
+    """
+    Ng = len(lam_abs)
+    
+    # Collective coordinates X - just random sampling (FAST!)
     X = np.zeros((Ng, 3))
     for k in range(3):
-        # Sample from equilibrium distribution
-        # Use 1/|lambda| to handle negative eigenvalues
-        # Skip first eigenvalue (center of mass mode, lambda[0] ≈ 0)
         X[1:, k] = np.sqrt(1.0 / lam_abs[1:]) * np.random.randn(Ng-1)
     
-    # X -> 3D coordinates R
+    # X -> 3D coordinates R - just matrix multiplication (FAST!)
     xyz = np.zeros((Ng, 3))
     for k in range(3):
         xyz[:, k] = np.dot(Qs, X[:, k])
     
-    # Center (necessary when diag(K) != 0)
+    # Center
     xyz = xyz - np.mean(xyz, axis=0)
     
-    # Check for NaN values
-    if np.any(np.isnan(xyz)):
-        print("    ⚠ WARNING: NaN values detected in structure!")
-        print(f"         Eigenvalue range: [{np.min(lam):.6e}, {np.max(lam):.6e}]")
-        # Replace NaN with 0
-        xyz = np.nan_to_num(xyz, nan=0.0)
+    return xyz
+
+def generate_and_save_structure(args):
+    """
+    Wrapper for parallel generation.
+    Generates one structure, computes stats, and saves files.
+    """
+    c, lam_abs, Qs, bins, output_dir = args
     
-    return xyz, lam
+    # Generate structure
+    xyz = generate_structure_fast(lam_abs, Qs)
+    
+    # Compute shape
+    asp, spf = compute_shape_stats(xyz)
+    
+    # Save files
+    coords_file = output_dir / f"structure_{c+1:04d}_genomic.txt"
+    save_xyz_with_genomic(xyz, bins, coords_file, c+1)
+    
+    xyz_file = output_dir / f"structure_{c+1:04d}.xyz"
+    save_simple_xyz(xyz, xyz_file, c+1)
+    
+    return asp, spf
 
 def save_xyz_with_genomic(xyz, bins, output_file, structure_id):
     """
@@ -200,18 +219,21 @@ def compute_shape_stats(xyz):
 
 def main():
     if len(sys.argv) < 3:
-        print('Usage: python HLM_K2xyz_with_genomic.py K_fit.txt bin_info.txt [NSamples]')
+        print('Usage: python HLM_K2xyz_with_genomic.py K_fit.txt bin_info.txt [NSamples] [--parallel]')
         print('\nExample bin_info.txt format:')
         print('# chr  start  end')
         print('chr1  0  500000')
         print('chr1  500000  1000000')
         print('...')
         print('\nOr use "none" if no genomic info available')
+        print('\nOptions:')
+        print('  --parallel    Use multiprocessing for faster generation')
         sys.exit(1)
     
     fk = str(sys.argv[1])
     fbin = str(sys.argv[2])
     ncfgs = int(sys.argv[3]) if len(sys.argv) > 3 else 10
+    use_parallel = '--parallel' in sys.argv
     
     print("="*60)
     print("HLM Structure Generator with Genomic Mapping")
@@ -241,32 +263,66 @@ def main():
     output_dir = Path(fk).parent / f"{Path(fk).stem}_structures"
     output_dir.mkdir(exist_ok=True)
     print(f"\nOutput directory: {output_dir}/")
-    print(f"Generating {ncfgs} structures...")
+    
+    # OPTIMIZATION: Precompute eigendecomposition ONCE
+    print(f"\nPrecomputing eigendecomposition for {Ng}×{Ng} matrix...")
+    lam_abs, Qs = precompute_eigendecomposition(K_fit)
+    
+    print(f"\nGenerating {ncfgs} structures...")
+    if use_parallel:
+        n_cores = cpu_count()
+        print(f"Using parallel processing with {n_cores} cores")
+        print("(Eigendecomposition precomputed, structures generated in parallel)")
+    else:
+        print("(Sequential generation - use --parallel for faster processing)")
     
     # Generate structures
     np.random.seed(1274)  # HLM-Genome default seed
     
-    shape_stats = []
-    for c in range(ncfgs):
-        # Generate structure
-        xyz, eigenvalues = generate_structure(K_fit)
-        
-        # Compute shape
-        asp, spf = compute_shape_stats(xyz)
-        shape_stats.append((asp, spf))
-        
-        # Save with genomic info
-        coords_file = output_dir / f"structure_{c+1:04d}_genomic.txt"
-        save_xyz_with_genomic(xyz, bins, coords_file, c+1)
-        
-        # Save standard XYZ (for visualization)
-        xyz_file = output_dir / f"structure_{c+1:04d}.xyz"
-        save_simple_xyz(xyz, xyz_file, c+1)
-        
-        if (c+1) % max(1, ncfgs//10) == 0:
-            print(f"  Generated {c+1}/{ncfgs} (asp={asp:.4f}, spf={spf:+.4f})")
+    start_gen = time.time()
     
-    print(f"\n✓ Saved {ncfgs} structures to {output_dir}/")
+    if use_parallel:
+        # Parallel generation
+        args_list = [(c, lam_abs, Qs, bins, output_dir) for c in range(ncfgs)]
+        
+        with Pool(processes=n_cores) as pool:
+            shape_stats = []
+            for i, (asp, spf) in enumerate(pool.imap(generate_and_save_structure, args_list), 1):
+                shape_stats.append((asp, spf))
+                if i % max(1, ncfgs//10) == 0:
+                    elapsed = time.time() - start_gen
+                    rate = i / elapsed
+                    eta_min = (ncfgs - i) / rate / 60 if rate > 0 else 0
+                    print(f"  Generated {i}/{ncfgs} | Rate: {rate:.1f} struct/s | ETA: {eta_min:.1f}min")
+    else:
+        # Sequential generation
+        shape_stats = []
+        for c in range(ncfgs):
+            # Generate structure (FAST - using precomputed eigendecomposition)
+            xyz = generate_structure_fast(lam_abs, Qs)
+            
+            # Compute shape
+            asp, spf = compute_shape_stats(xyz)
+            shape_stats.append((asp, spf))
+            
+            # Save with genomic info
+            coords_file = output_dir / f"structure_{c+1:04d}_genomic.txt"
+            save_xyz_with_genomic(xyz, bins, coords_file, c+1)
+            
+            # Save standard XYZ (for visualization)
+            xyz_file = output_dir / f"structure_{c+1:04d}.xyz"
+            save_simple_xyz(xyz, xyz_file, c+1)
+            
+            if (c+1) % max(1, ncfgs//10) == 0:
+                elapsed = time.time() - start_gen
+                rate = (c+1) / elapsed
+                eta_min = (ncfgs - c - 1) / rate / 60 if rate > 0 else 0
+                print(f"  Generated {c+1}/{ncfgs} (asp={asp:.4f}, spf={spf:+.4f}) | "
+                      f"Rate: {rate:.1f} struct/s | ETA: {eta_min:.1f}min")
+    
+    gen_time = time.time() - start_gen
+    print(f"\n✓ Generated {ncfgs} structures in {gen_time:.1f}s ({ncfgs/gen_time:.1f} struct/s)")
+    print(f"✓ Saved to {output_dir}/")
     
     # Summary statistics
     asps = [s[0] for s in shape_stats]
