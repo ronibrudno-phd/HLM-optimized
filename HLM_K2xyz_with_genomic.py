@@ -79,11 +79,12 @@ def generate_structure(K_fit, seed=None):
     """
     Generate single structure using HLM eigenvalue sampling.
     
-    This is the HLM-Genome method:
+    This is the HLM-Genome method with fix for negative K values:
     1. Compute Laplacian L = diag(d) - K
     2. Eigendecompose: L = Q * Lambda * Q^T
-    3. Sample X_i ~ N(0, 1/lambda_i) for i > 0
-    4. Transform: R = Q * X
+    3. Handle negative eigenvalues (from repulsive K values)
+    4. Sample X_i ~ N(0, 1/|lambda_i|) for i > 0
+    5. Transform: R = Q * X
     """
     if seed is not None:
         np.random.seed(seed)
@@ -97,12 +98,29 @@ def generate_structure(K_fit, seed=None):
     # Eigenvalues and eigenvectors
     lam, Qs = np.linalg.eigh(Lap)
     
+    # CRITICAL FIX: Handle negative eigenvalues
+    # Negative eigenvalues arise from repulsive interactions (negative K)
+    # We need to use absolute value for sqrt
+    lam_abs = np.abs(lam)
+    
+    # Also need minimum eigenvalue threshold to avoid division by very small numbers
+    # First eigenvalue should be ~0 (center of mass mode), but may be slightly negative
+    min_eigenvalue = 1e-10
+    lam_abs = np.maximum(lam_abs, min_eigenvalue)
+    
+    # Report eigenvalue statistics (only for first structure to avoid spam)
+    num_negative = np.sum(lam < 0)
+    if num_negative > 0 and seed in [None, 1274]:
+        print(f"    Info: {num_negative}/{Ng} eigenvalues are negative (repulsive interactions)")
+        print(f"         Range: [{np.min(lam):.6e}, {np.max(lam):.6e}]")
+    
     # Collective coordinates X
     X = np.zeros((Ng, 3))
     for k in range(3):
         # Sample from equilibrium distribution
-        # Use 1/lambda (not 1/3/lambda) as in HLM-Genome
-        X[1:, k] = np.sqrt(1.0 / lam[1:]) * np.random.randn(Ng-1)
+        # Use 1/|lambda| to handle negative eigenvalues
+        # Skip first eigenvalue (center of mass mode, lambda[0] ≈ 0)
+        X[1:, k] = np.sqrt(1.0 / lam_abs[1:]) * np.random.randn(Ng-1)
     
     # X -> 3D coordinates R
     xyz = np.zeros((Ng, 3))
@@ -111,6 +129,13 @@ def generate_structure(K_fit, seed=None):
     
     # Center (necessary when diag(K) != 0)
     xyz = xyz - np.mean(xyz, axis=0)
+    
+    # Check for NaN values
+    if np.any(np.isnan(xyz)):
+        print("    ⚠ WARNING: NaN values detected in structure!")
+        print(f"         Eigenvalue range: [{np.min(lam):.6e}, {np.max(lam):.6e}]")
+        # Replace NaN with 0
+        xyz = np.nan_to_num(xyz, nan=0.0)
     
     return xyz, lam
 
