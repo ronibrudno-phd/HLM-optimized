@@ -548,6 +548,9 @@ if __name__ == "__main__":
            f"#P_fit N={N} range=[{np.nanmin(P_fit):.5e}, {np.nanmax(P_fit):.5e}] "
            f"pearson={p1:.6f} {p2:.6f}\n")
     
+    # Calculate total time BEFORE writing summary
+    total_time = time.time() - start_total
+    
     # Save comprehensive summary file
     summary_file = f"{dataDir}/SUMMARY_{input_name}.txt"
     with open(summary_file, 'w') as f:
@@ -598,9 +601,7 @@ if __name__ == "__main__":
     
     print(f"  ✓ Saved summary: {summary_file}")
     
-    total_time = time.time() - start_total
-    
-    # Final summary
+    # Final summary (total_time already calculated above)
     print("\n" + "="*80)
     print("FINAL SUMMARY")
     print("="*80)
