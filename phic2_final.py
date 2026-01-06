@@ -311,7 +311,7 @@ def phic2_final(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, ITE
             last_print = time.time()
         
         # Checkpointing
-        if iteration - last_checkpoint >= 100:
+        if iteration - last_checkpoint >= 1000:
             cp_file = save_checkpoint(K, float(cost), iteration, checkpoint_dir)
             print(f"  Checkpoint saved: {cp_file}")
             last_checkpoint = iteration
