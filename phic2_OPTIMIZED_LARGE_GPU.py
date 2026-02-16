@@ -14,18 +14,12 @@ try:
     HAS_PSUTIL = True
 except ImportError:
     HAS_PSUTIL = False
-    print("Warning: psutil not available")
 
 cp.set_printoptions(precision=3, linewidth=200)
 warnings.filterwarnings('ignore')
 
-# OPTIMIZED VERSION FOR LARGE GPU
-# Key improvements:
-# 1. Better ETA estimation for large matrices
-# 2. More aggressive optimization early on
-# 3. Better convergence detection
-# 4. Momentum-based updates
-# 5. Better K_bound management
+# STABLE VERSION - Conservative learning rates
+# Fixes: Divergence issue by using smaller, safer learning rates
 
 if not len(sys.argv) >= 2:
     print("usage:: python phic2_final.py normalized-HiC-Contact-Matrix")
@@ -34,16 +28,14 @@ if not len(sys.argv) >= 2:
 fhic = str(sys.argv[1])
 
 print("="*80)
-print("PHi-C2 OPTIMIZED FOR LARGE GPU")
+print("PHi-C2 STABLE VERSION")
 print("="*80)
-print("Improvements:")
-print("  [+] Optimized ETA estimation for large matrices")
-print("  [+] Momentum-based gradient descent")
-print("  [+] Better convergence detection")
-print("  [+] Adaptive K_bound management")
+print("Features:")
+print("  [+] Conservative learning rates (no divergence)")
+print("  [+] Gradient clipping for stability")
+print("  [+] Better K_bound management")
 print("="*80)
 
-# Check CuPy solve capabilities
 _SOLVE_SUPPORTS_ASSUME_A = True
 try:
     test = cp.eye(2, dtype=cp.float32)
@@ -51,7 +43,6 @@ try:
     del test
 except TypeError:
     _SOLVE_SUPPORTS_ASSUME_A = False
-    print("Note: Using standard solve (assume_a not supported)")
 
 def print_memory():
     if HAS_PSUTIL:
@@ -73,22 +64,16 @@ def Init_K(N, INIT_K0, dtype):
     return K
 
 def K2P_inplace(K, out_P, identity, eps_diag=1e-5, rc2=1.0):
-    """
-    Memory-optimized K to P conversion
-    Uses solve() instead of inv() for better stability
-    """
+    """Memory-optimized K to P conversion"""
     N = K.shape[0]
     
-    # Compute degree vector
     d = cp.sum(K, axis=0, dtype=cp.float32)
     
-    # Build Laplacian submatrix L[1:,1:]
     L11 = (-K[1:, 1:]).copy()
     idx = cp.arange(N - 1, dtype=cp.int32)
     L11[idx, idx] += d[1:]
     L11[idx, idx] += cp.float32(eps_diag)
     
-    # Solve L11 * Q = I
     if _SOLVE_SUPPORTS_ASSUME_A:
         Q = cp.linalg.solve(L11, identity, assume_a='pos')
     else:
@@ -96,7 +81,6 @@ def K2P_inplace(K, out_P, identity, eps_diag=1e-5, rc2=1.0):
     
     A = cp.diagonal(Q)
     
-    # Build G matrix in-place
     out_P.fill(0)
     sub = out_P[1:N, 1:N]
     sub[...] = -2.0 * Q
@@ -105,7 +89,6 @@ def K2P_inplace(K, out_P, identity, eps_diag=1e-5, rc2=1.0):
     out_P[0, 1:N] = A
     out_P[1:N, 0] = A
     
-    # Convert to P: (1 + 3*G/rc2)^(-1.5)
     out_P *= cp.float32(3.0 / rc2)
     out_P += cp.float32(1.0)
     cp.maximum(out_P, cp.float32(1e-6), out=out_P)
@@ -116,9 +99,7 @@ def K2P_inplace(K, out_P, identity, eps_diag=1e-5, rc2=1.0):
 
 def constrain_K(K, K_bound):
     """Apply physical constraints to K"""
-    # Symmetric (REQUIRED - Newton's 3rd law)
     K = 0.5 * (K + K.T)
-    # Bound magnitude (allow negative for repulsion)
     K = cp.clip(K, -K_bound, K_bound)
     return K
 
@@ -127,37 +108,34 @@ def cost_func(P_dif, N):
     return cp.sqrt(cp.sum(P_dif**2)) / N
 
 def estimate_eta(P_obs, K_init, N, identity, P_temp):
-    """IMPROVED: Better ETA estimation for large matrices"""
+    """CONSERVATIVE: Much smaller learning rates to prevent divergence"""
     print("\nEstimating initial learning rate...")
     K2P_inplace(K_init, P_temp, identity)
     grad_norm = cp.sqrt(cp.mean((P_temp - P_obs)**2))
     
     print(f"  Initial gradient norm: {float(grad_norm):.5e}")
     
-    # CRITICAL FIX: Much better scaling for large matrices
-    base_eta = 2e-3  # Higher base rate
+    # MUCH MORE CONSERVATIVE SCALING
+    base_eta = 5e-5  # Reduced from 2e-3
     
     if N < 5000:
-        # Small matrices: original scaling
         size_factor = (2869.0 / N)**2
     elif N < 15000:
-        # Medium matrices: moderate scaling
-        size_factor = (5000.0 / N)**0.7
+        size_factor = (5000.0 / N)  # Linear, not sqrt
     else:
-        # Large matrices (>15K): gentle scaling
-        size_factor = (7500.0 / N)**0.5
+        # For large matrices: very gentle
+        size_factor = (7500.0 / N)
     
-    # More aggressive gradient factor
-    gradient_factor = min(1.0, 5e-3 / float(grad_norm))
+    gradient_factor = min(1.0, 1e-3 / float(grad_norm))
     eta = base_eta * size_factor * gradient_factor
     
-    # MUCH wider range for large matrices
+    # Tighter bounds
     if N > 20000:
-        eta = np.clip(eta, 5e-6, 5e-2)  # 10x wider range
+        eta = np.clip(eta, 1e-7, 1e-4)  # Much smaller max
     elif N > 10000:
-        eta = np.clip(eta, 1e-6, 1e-2)
+        eta = np.clip(eta, 1e-7, 5e-5)
     else:
-        eta = np.clip(eta, 1e-7, 1e-3)
+        eta = np.clip(eta, 1e-8, 1e-4)
     
     print(f"  Size factor: {size_factor:.4f}")
     print(f"  Gradient factor: {gradient_factor:.4f}")
@@ -165,47 +143,41 @@ def estimate_eta(P_obs, K_init, N, identity, P_temp):
     return eta
 
 def save_checkpoint(K, cost, iteration, checkpoint_dir):
-    """Save checkpoint for recovery"""
     cp_file = f"{checkpoint_dir}/checkpoint_iter{iteration}.npz"
     K_cpu = cp.asnumpy(K)
     np.savez_compressed(cp_file, K=K_cpu, cost=cost, iteration=iteration)
     return cp_file
 
-def phic2_optimized(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, ITERATION_MAX=1000000):
-    """
-    OPTIMIZED PHi-C2 with momentum and better convergence
-    """
-    # Better K_bound initialization
+def phic2_stable(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, ITERATION_MAX=1000000):
+    """STABLE version with conservative updates"""
+    
+    # Conservative K_bound - DON'T LET IT EXPAND TOO MUCH
     if N < 3000:
         K_bound = 1000.0
     elif N < 10000:
         K_bound = 500.0
     elif N < 20000:
-        K_bound = 300.0  # Increased from 200
+        K_bound = 200.0
     else:
-        # For very large matrices, start higher
-        K_bound = max(100.0, 300.0 * (20000.0 / N)**0.5)
+        K_bound = 100.0  # Fixed at 100 for large matrices
+    
+    K_bound_max = K_bound * 3  # Hard limit on expansion
     
     print("\n" + "="*80)
-    print("Starting PHi-C2 Optimization (OPTIMIZED)")
+    print("Starting PHi-C2 Optimization (STABLE)")
     print("="*80)
     print(f"Matrix size: {N}x{N}")
     print(f"Initial ETA: {ETA_init:.2e}")
-    print(f"K bound: +/-{K_bound:.1f}")
+    print(f"K bound: +/-{K_bound:.1f} (max: +/-{K_bound_max:.1f})")
     print(f"Checkpoint directory: {checkpoint_dir}")
     print()
     
     ETA = ETA_init
-    ETA_min = ETA_init * 1e-5  # Allow going lower
+    ETA_min = ETA_init * 1e-5
     
-    # Pre-allocate arrays
     identity = cp.eye(N-1, dtype=cp.float32)
     P_fit = cp.zeros((N, N), dtype=cp.float32)
     P_dif = cp.zeros((N, N), dtype=cp.float32)
-    
-    # Momentum for gradient descent
-    momentum = cp.zeros_like(K)
-    beta = 0.9  # Momentum coefficient
     
     # Initial state
     K2P_inplace(K, P_fit, identity)
@@ -224,7 +196,7 @@ def phic2_optimized(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10,
     best_iter = 0
     
     cost_history = []
-    oscillation_count = 0
+    consecutive_bad = 0  # Track consecutive cost increases
     eta_reduction_count = 0
     k_bound_expansions = 0
     
@@ -234,33 +206,41 @@ def phic2_optimized(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10,
     while iteration < ITERATION_MAX:
         cost_bk = cost
         
-        # Momentum-based gradient descent
-        momentum = beta * momentum + (1 - beta) * P_dif
-        K -= ETA * momentum
+        # GRADIENT CLIPPING to prevent explosion
+        grad_norm = float(cp.sqrt(cp.mean(P_dif**2)))
+        clip_threshold = 1.0  # Clip gradients above this
+        if grad_norm > clip_threshold:
+            P_dif = P_dif * (clip_threshold / grad_norm)
         
-        # Check K bounds
+        # Simple gradient descent (NO momentum for stability)
+        K -= ETA * P_dif
+        
+        # Check K bounds - BE STRICT
         K_min = float(cp.min(K))
         K_max = float(cp.max(K))
         K_absmax = max(abs(K_min), abs(K_max))
         
-        # Dynamic bound expansion
-        if K_absmax > K_bound * 1.2:
-            old_bound = K_bound
-            K_bound = K_absmax * 1.5
-            k_bound_expansions += 1
-            print(f"\n  -> K_bound expanded at iteration {iteration}")
-            print(f"     Old: +/-{old_bound:.1f} -> New: +/-{K_bound:.1f}")
+        # Only allow LIMITED expansion
+        if K_absmax > K_bound * 1.1:  # Only 10% overflow
+            if K_bound < K_bound_max:
+                old_bound = K_bound
+                K_bound = min(K_absmax * 1.2, K_bound_max)  # Limited expansion
+                k_bound_expansions += 1
+                print(f"\n  -> K_bound: {old_bound:.1f} -> {K_bound:.1f} (iter {iteration})")
+            else:
+                # Hit max bound - clip hard
+                print(f"\n  -> K_bound at maximum ({K_bound_max:.1f}), clipping (iter {iteration})")
         
         # Apply constraints
         K = constrain_K(K, K_bound)
         
-        # Check K health
+        # Sanity checks
         if cp.any(cp.isnan(K)) or cp.any(cp.isinf(K)):
-            print(f"\n  [WARNING] Invalid K at iter {iteration}, reverting")
+            print(f"\n  [ERROR] Invalid K at iter {iteration}, reverting")
             K = best_K.copy()
-            momentum.fill(0)
-            ETA *= 0.5
+            ETA *= 0.1
             eta_reduction_count += 1
+            consecutive_bad = 0
             continue
         
         # Forward pass
@@ -269,27 +249,27 @@ def phic2_optimized(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10,
             P_dif[...] = P_fit - P_obs
             cost = cost_func(P_dif, N)
         except Exception as e:
-            print(f"\n  [WARNING] K2P error at iter {iteration}: {e}")
+            print(f"\n  [ERROR] K2P failed at iter {iteration}: {e}")
             K = best_K.copy()
-            momentum.fill(0)
-            ETA *= 0.5
+            ETA *= 0.1
             eta_reduction_count += 1
+            consecutive_bad = 0
             continue
         
-        if cp.isnan(cost) or cp.isinf(cost):
-            print(f"\n  [WARNING] Invalid cost at iter {iteration}")
+        if cp.isnan(cost) or cp.isinf(cost) or cost > 10.0:  # Cost too high
+            print(f"\n  [ERROR] Bad cost at iter {iteration}: {float(cost):.2e}")
             K = best_K.copy()
-            momentum.fill(0)
+            K2P_inplace(K, P_fit, identity)
+            P_dif[...] = P_fit - P_obs
             cost = best_cost
-            ETA *= 0.5
+            ETA *= 0.1
             eta_reduction_count += 1
+            consecutive_bad = 0
             continue
         
-        # Track improvement
         cost_delta = cost_bk - cost
         cost_history.append(float(cost))
         
-        # Keep only recent history
         if len(cost_history) > 1000:
             cost_history.pop(0)
         
@@ -298,32 +278,28 @@ def phic2_optimized(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10,
             best_cost = cost
             best_K = K.copy()
             best_iter = iteration
-            oscillation_count = 0
+            consecutive_bad = 0
         else:
             if cost_delta < 0:  # Cost increased
-                oscillation_count += 1
+                consecutive_bad += 1
+            else:
+                consecutive_bad = max(0, consecutive_bad - 1)
         
-        # Handle oscillations
-        if oscillation_count >= 5:  # Faster response
-            print(f"\n  [INFO] Oscillations detected at iter {iteration}")
+        # Handle bad updates MORE AGGRESSIVELY
+        if consecutive_bad >= 3:  # Faster response
+            print(f"\n  [INFO] {consecutive_bad} bad updates at iter {iteration}")
             print(f"    ETA: {ETA:.2e} -> {ETA*0.5:.2e}")
             ETA *= 0.5
             eta_reduction_count += 1
             K = best_K.copy()
-            momentum.fill(0)  # Reset momentum
             K2P_inplace(K, P_fit, identity)
             P_dif[...] = P_fit - P_obs
             cost = best_cost
-            oscillation_count = 0
+            consecutive_bad = 0
             
             if ETA < ETA_min:
                 print(f"\n  [STOP] ETA < minimum ({ETA_min:.2e})")
                 break
-        
-        # Adaptive ETA increase (when doing well)
-        if cost_delta > 0 and oscillation_count == 0 and iteration % 50 == 0:
-            if cost_delta > 1e-7 * cost_bk:  # Good progress
-                ETA = min(ETA * 1.05, ETA_init * 2)  # Allow going higher than initial
         
         # Progress reporting
         if iteration == 1 or iteration % 100 == 0 or time.time() - last_print > 10:
@@ -333,15 +309,14 @@ def phic2_optimized(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10,
             
             print(f"Iter {iteration:7d} | Cost: {cost:.6e} | dCost: {cost_delta:+.2e} | "
                   f"Best: {best_cost:.6e} | ETA: {ETA:.2e}")
-            print(f"  Rate: {rate:.2f} it/s | Time: {elapsed/60:.1f}m | "
-                  f"Since best: {since_best} | ETA red: {eta_reduction_count} | "
-                  f"K_bound exp: {k_bound_expansions}")
+            print(f"  Rate: {rate:.2f} it/s | Since best: {since_best} | "
+                  f"Bad: {consecutive_bad} | ETA red: {eta_reduction_count} | K_bound: {K_bound:.1f}")
             print_memory()
             
             c_traj.append([float(cost), time.time(), ETA])
             last_print = time.time()
         
-        # Checkpointing every 500 iterations
+        # Checkpointing
         if iteration - last_checkpoint >= 500:
             cp_file = save_checkpoint(K, float(cost), iteration, checkpoint_dir)
             last_checkpoint = iteration
@@ -349,36 +324,32 @@ def phic2_optimized(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10,
                 print(f"  -> Checkpoint: {os.path.basename(cp_file)}")
         
         # Convergence checks
-        # 1. Cost delta check
-        if iteration > 200:
+        if iteration > 500:
             if abs(cost_delta) < ALPHA * ETA and cost_delta >= 0:
                 print(f"\n[CONVERGED] Cost change < threshold")
-                print(f"  dCost: {abs(cost_delta):.2e} < {ALPHA*ETA:.2e}")
                 break
         
-        # 2. Stagnation check (adaptive window)
-        window = max(500, min(2000, N // 20))
+        # Stagnation
+        window = max(1000, min(3000, N // 15))
         if iteration > window and iteration - best_iter > window:
             recent_std = np.std(cost_history[-window:]) if len(cost_history) >= window else np.inf
             if recent_std < 1e-9:
-                print(f"\n[CONVERGED] Cost variance very low over {window} iterations")
-                print(f"  Std: {recent_std:.2e}")
+                print(f"\n[CONVERGED] Cost stable over {window} iterations")
                 break
         
-        # 3. Max stagnation
-        max_stagnation = max(5000, N // 5)
-        if iteration - best_iter > max_stagnation:
-            print(f"\n[STOP] No improvement for {max_stagnation} iterations")
+        # Max stagnation
+        max_stag = max(10000, N // 3)
+        if iteration - best_iter > max_stag:
+            print(f"\n[STOP] No improvement for {max_stag} iterations")
             break
         
-        # 4. Max ETA reductions
-        if eta_reduction_count > 40:
+        # Max ETA reductions
+        if eta_reduction_count > 50:
             print(f"\n[STOP] Too many ETA reductions ({eta_reduction_count})")
             break
         
         iteration += 1
         
-        # Periodic cleanup
         if iteration % 500 == 0:
             cp.get_default_memory_pool().free_all_blocks()
     
@@ -387,9 +358,7 @@ def phic2_optimized(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10,
         print(f"\n[INFO] Using best K from iteration {best_iter}")
         K = best_K.copy()
         K2P_inplace(K, P_fit, identity)
-        cost = best_cost
     
-    # Save final checkpoint
     cp_file = save_checkpoint(K, float(best_cost), iteration, checkpoint_dir)
     print(f"\nFinal checkpoint: {os.path.basename(cp_file)}")
     
@@ -405,17 +374,14 @@ def phic2_optimized(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10,
     print(f"Improvement:         {100*(c_traj[0,0]-best_cost)/c_traj[0,0]:.2f}%")
     print(f"ETA reductions:      {eta_reduction_count}")
     print(f"K_bound expansions:  {k_bound_expansions}")
-    print(f"Final K_bound:       +/-{K_bound:.1f}")
     print("="*80)
     
     paras_fit = f"N={N} ETA_init={ETA_init:.2e} iterations={iteration}"
     
-    del identity, P_dif, momentum
-    
+    del identity, P_dif
     return K, P_fit, c_traj, paras_fit
 
 def saveLg(fn, xy, ct):
-    """Save log file"""
     with open(fn, 'w') as fw:
         fw.write(ct)
         for row in xy:
@@ -424,7 +390,6 @@ def saveLg(fn, xy, ct):
     print(f"  Saved: {fn}")
 
 def saveMx(fn, xy, ct, chunk_size=5000):
-    """Save matrix file with progress"""
     print(f"  Saving {fn}...")
     with open(fn, 'w') as fw:
         fw.write(ct)
@@ -438,10 +403,6 @@ def saveMx(fn, xy, ct, chunk_size=5000):
                 print(f"    {chunk_start}/{n} rows...")
     print(f"  [OK] Saved: {fn}")
 
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
-
 if __name__ == "__main__":
     start_total = time.time()
     
@@ -449,7 +410,6 @@ if __name__ == "__main__":
         print(f'ERROR: Cannot find {fhic}')
         sys.exit(1)
     
-    # Load Hi-C matrix
     print(f"\nLoading Hi-C matrix: {fhic}")
     start_load = time.time()
     
@@ -467,11 +427,9 @@ if __name__ == "__main__":
     load_time = time.time() - start_load
     print(f"\n[OK] Loaded {N}x{N} in {load_time:.1f}s")
     
-    # Preprocess
     cp.nan_to_num(P_obs, copy=False)
     P_obs = P_obs + cp.eye(N, dtype=cp.float32)
     
-    # Matrix stats
     P_obs_cpu = cp.asnumpy(P_obs)
     nonzero = int(np.count_nonzero(P_obs_cpu))
     sparsity = 100 * (1 - nonzero/(N*N))
@@ -482,34 +440,30 @@ if __name__ == "__main__":
     del P_obs_cpu
     print_memory()
     
-    # Initialize K
     print("\nInitializing spring constants...")
     K_fit = Init_K(N, 0.5, cp.float32)
     
-    # Estimate ETA
     P_temp = cp.zeros((N, N), dtype=cp.float32)
     identity_temp = cp.eye(N-1, dtype=cp.float32)
     ETA_init = estimate_eta(P_obs, K_fit, N, identity_temp, P_temp)
     del P_temp, identity_temp
     gc.collect()
     
-    # Create output directory
     input_basename = os.path.basename(fhic)
     input_name = os.path.splitext(input_basename)[0]
-    dataDir = f"{input_name}_phic2_OPTIMIZED"
+    dataDir = f"{input_name}_phic2_STABLE"
     os.makedirs(dataDir, exist_ok=True)
     checkpoint_dir = f"{dataDir}/checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     print(f"\nOutput directory: {dataDir}/")
     
-    # Run optimization
     print("\n" + "="*80)
     print("STARTING OPTIMIZATION")
     print("="*80)
     start_opt = time.time()
     
-    K_fit, P_fit, c_traj, paras_fit = phic2_optimized(
+    K_fit, P_fit, c_traj, paras_fit = phic2_stable(
         K_fit, N, P_obs, checkpoint_dir,
         ETA_init=ETA_init,
         ALPHA=1.0e-10,
@@ -519,34 +473,27 @@ if __name__ == "__main__":
     opt_time = time.time() - start_opt
     print(f"\nOptimization time: {opt_time/60:.1f} min ({opt_time/3600:.1f} hours)")
     
-    # Transfer to CPU
     print("\nTransferring results to CPU...")
     c_traj_np = c_traj
     K_fit = cp.asnumpy(K_fit)
     P_fit = cp.asnumpy(P_fit)
     P_obs = cp.asnumpy(P_obs)
-    
     print("  [OK] Transfer complete")
     
-    # Save results
     print("\n" + "="*80)
     print("SAVING RESULTS")
     print("="*80)
     
     fo = f"{dataDir}/N{N}"
     
-    # Log file
     c_traj_np[:,1] = c_traj_np[:,1] - c_traj_np[0,1]
     saveLg(fo+'.log', c_traj_np, f"#{paras_fit}\n#cost time eta\n")
     
-    # K matrix
     saveMx(fo+'.K_fit', K_fit,
            f"#K_fit N={N} range=[{np.min(K_fit):.5e}, {np.max(K_fit):.5e}]\n")
     
-    # Pearson correlation
     print("\nComputing Pearson correlation...")
     
-    # Fast sampling
     print("  [1/2] Sampling-based (1M samples)...")
     def pearson_sample(P_fit_arr, P_obs_arr, n_samples=1_000_000, seed=0):
         rng = np.random.default_rng(seed)
@@ -565,7 +512,6 @@ if __name__ == "__main__":
     print(f"    Sample Pearson (all):   {p1_s:.6f}")
     print(f"    Sample Pearson (obs>0): {p2_s:.6f}")
     
-    # Full exact
     print("  [2/2] Full exact Pearson (all pairs)...")
     triMask = np.where(np.triu(np.ones((N,N)),1)>0)
     pijMask = np.where(np.triu(P_obs,1)>0)
@@ -576,15 +522,12 @@ if __name__ == "__main__":
     print(f"    Full Pearson (all):     {p1:.6f}")
     print(f"    Full Pearson (obs>0):   {p2:.6f}")
     
-    # P matrix
     saveMx(fo+'.P_fit', P_fit,
            f"#P_fit N={N} range=[{np.nanmin(P_fit):.5e}, {np.nanmax(P_fit):.5e}] "
            f"pearson={p1:.6f} {p2:.6f}\n")
     
-    # Calculate total time
     total_time = time.time() - start_total
     
-    # Save summary
     summary_file = f"{dataDir}/SUMMARY_{input_name}.txt"
     with open(summary_file, 'w') as f:
         f.write("="*80 + "\n")
@@ -603,23 +546,10 @@ if __name__ == "__main__":
         f.write(f"  Pearson (all):           {p1:.6f}\n")
         f.write(f"  Pearson (obs>0):         {p2:.6f}\n")
         f.write(f"  K range:                 [{np.min(K_fit):.5e}, {np.max(K_fit):.5e}]\n")
-        f.write(f"  P range:                 [{np.nanmin(P_fit):.5e}, {np.nanmax(P_fit):.5e}]\n")
         f.write("="*80 + "\n")
-        
-        # Quality assessment
-        if p1 >= 0.90:
-            f.write("\nQUALITY: EXCELLENT (Pearson > 0.90)\n")
-        elif p1 >= 0.85:
-            f.write("\nQUALITY: GOOD (Pearson > 0.85)\n")
-        elif p1 >= 0.75:
-            f.write("\nQUALITY: ACCEPTABLE (Pearson > 0.75)\n")
-        else:
-            f.write("\nQUALITY: POOR (Pearson < 0.75)\n")
-            f.write("Consider using coarser resolution (500KB or 1MB)\n")
     
     print(f"  [OK] Saved summary: {summary_file}")
     
-    # Final summary
     print("\n" + "="*80)
     print("FINAL SUMMARY")
     print("="*80)
@@ -631,15 +561,14 @@ if __name__ == "__main__":
     print(f"Output directory:          {dataDir}/")
     print("="*80)
     
-    # Quality interpretation
     if p1 >= 0.90:
-        print("\n[EXCELLENT] Pearson > 0.90 - Great fit!")
+        print("\n[EXCELLENT] Pearson > 0.90")
     elif p1 >= 0.85:
-        print("\n[GOOD] Pearson > 0.85 - Acceptable results")
+        print("\n[GOOD] Pearson > 0.85")
     elif p1 >= 0.75:
-        print("\n[ACCEPTABLE] Pearson > 0.75 - Consider coarser resolution")
+        print("\n[ACCEPTABLE] Pearson > 0.75")
     else:
-        print("\n[POOR] Pearson < 0.75 - Try 500KB or 1MB resolution")
+        print("\n[POOR] Pearson < 0.75 - Try coarser resolution")
     
     print(f"\nAll files saved to: {dataDir}/")
     print("Done!")
