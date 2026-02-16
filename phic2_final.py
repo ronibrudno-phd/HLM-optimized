@@ -135,12 +135,25 @@ def estimate_eta(P_obs, K_init, N, identity, P_temp):
     print(f"  Initial gradient norm: {float(grad_norm):.5e}")
     
     # Scale based on matrix size and gradient
-    base_eta = 1e-4
-    size_factor = (2869.0 / N)**2
-    gradient_factor = min(1.0, 1e-4 / float(grad_norm))
-    eta = base_eta * size_factor * gradient_factor
-    eta = np.clip(eta, 1e-8, 1e-4)
+    base_eta = 1e-3
+    if N < 5000:
+        # For small matrices, use original-style scaling
+        size_factor = (2869.0 / N)**2
+    else:
+        # For large matrices (like 27K), use gentler scaling
+        size_factor = (5000.0 / N)**0.5  # Much less aggressive
     
+    gradient_factor = min(1.0, 1e-3 / float(grad_norm))
+    eta = base_eta * size_factor * gradient_factor
+    
+    # Wider range for large matrices
+    if N > 20000:
+        eta = np.clip(eta, 1e-6, 1e-2)
+    else:
+        eta = np.clip(eta, 1e-8, 1e-4)
+    
+    print(f"  Size factor: {size_factor:.4f}")
+    print(f"  Gradient factor: {gradient_factor:.4f}")
     print(f"  Initial ETA: {eta:.2e}")
     return eta
 
@@ -164,7 +177,8 @@ def phic2_final(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, ITE
     elif N < 20000:
         K_bound = 200.0   # For ~200KB resolution
     else:
-        K_bound = 100.0   # For ~100KB resolution (your case)
+        # For very large matrices (>20K), use adaptive starting bound
+        K_bound = max(50.0, 200.0 * (20000.0 / N)**0.5)   # For ~100KB resolution (your case)
     
     print("\n" + "="*80)
     print("Starting PHi-C2 Optimization")
