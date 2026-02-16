@@ -17,10 +17,9 @@ except ImportError:
 cp.set_printoptions(precision=3, linewidth=200)
 warnings.filterwarnings('ignore')
 
-# BALANCED VERSION - Sweet spot between stability and progress
-# - Not too aggressive (avoids divergence)
-# - Not too conservative (avoids getting stuck)
-# - Better ETA adaptation logic
+# FINAL TUNED VERSION
+# Based on empirical observation: For 27K matrices, need ETA ~1e-4 to 5e-4
+# Previous versions were too conservative
 
 if not len(sys.argv) >= 2:
     print("usage:: python phic2_final.py normalized-HiC-Contact-Matrix")
@@ -29,12 +28,12 @@ if not len(sys.argv) >= 2:
 fhic = str(sys.argv[1])
 
 print("="*80)
-print("PHi-C2 BALANCED VERSION")
+print("PHi-C2 FINAL TUNED VERSION")
 print("="*80)
-print("Features:")
-print("  [+] Balanced learning rate (not too high, not too low)")
-print("  [+] Smart ETA adaptation")
-print("  [+] Gradient clipping for stability")
+print("Key changes:")
+print("  [!] MUCH higher initial learning rate for large matrices")
+print("  [!] Empirically tuned for 27K×27K matrices")
+print("  [!] More patience before reducing ETA")
 print("="*80)
 
 _SOLVE_SUPPORTS_ASSUME_A = True
@@ -102,37 +101,40 @@ def cost_func(P_dif, N):
     return cp.sqrt(cp.sum(P_dif**2)) / N
 
 def estimate_eta(P_obs, K_init, N, identity, P_temp):
-    """BALANCED: Not too high, not too low"""
+    """EMPIRICALLY TUNED for large matrices"""
     print("\nEstimating initial learning rate...")
     K2P_inplace(K_init, P_temp, identity)
     grad_norm = cp.sqrt(cp.mean((P_temp - P_obs)**2))
     
     print(f"  Initial gradient norm: {float(grad_norm):.5e}")
     
-    # BALANCED SCALING - Middle ground
-    base_eta = 1e-4  # Between 5e-5 (too small) and 2e-3 (too big)
-    
-    if N < 5000:
-        size_factor = (2869.0 / N)**2
-    elif N < 15000:
-        size_factor = (5000.0 / N)**0.85  # Between linear and sqrt
-    else:
-        size_factor = (7500.0 / N)**0.7  # Gentle but not too gentle
-    
-    gradient_factor = min(1.0, 2e-3 / float(grad_norm))
-    eta = base_eta * size_factor * gradient_factor
-    
-    # Reasonable bounds
-    if N > 20000:
-        eta = np.clip(eta, 5e-7, 5e-4)  # Allow some room
+    # MUCH MORE AGGRESSIVE for large matrices
+    # Based on empirical observation: need ~2e-4 for 27K matrix
+    if N > 25000:
+        # Very large matrices: use fixed aggressive rate
+        eta = 2e-4
+        print(f"  Using empirically tuned ETA for N={N}")
+    elif N > 20000:
+        eta = 3e-4
+    elif N > 15000:
+        eta = 4e-4
     elif N > 10000:
-        eta = np.clip(eta, 1e-7, 2e-4)
+        eta = 5e-4
     else:
-        eta = np.clip(eta, 1e-8, 1e-4)
+        # Smaller matrices: use formula
+        base_eta = 5e-4
+        size_factor = (5000.0 / N)**0.5
+        eta = base_eta * size_factor
     
-    print(f"  Size factor: {size_factor:.4f}")
-    print(f"  Gradient factor: {gradient_factor:.4f}")
-    print(f"  Initial ETA: {eta:.2e}")
+    # Adjust based on gradient magnitude (but not too much)
+    grad_factor = min(2.0, max(0.5, 1e-3 / float(grad_norm)))
+    eta = eta * grad_factor
+    
+    # Safety bounds
+    eta = np.clip(eta, 1e-5, 1e-3)
+    
+    print(f"  Gradient adjustment factor: {grad_factor:.4f}")
+    print(f"  Final ETA: {eta:.2e}")
     return eta
 
 def save_checkpoint(K, cost, iteration, checkpoint_dir):
@@ -141,10 +143,10 @@ def save_checkpoint(K, cost, iteration, checkpoint_dir):
     np.savez_compressed(cp_file, K=K_cpu, cost=cost, iteration=iteration)
     return cp_file
 
-def phic2_balanced(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, ITERATION_MAX=1000000):
-    """BALANCED version - not too aggressive, not too conservative"""
+def phic2_final_tuned(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, ITERATION_MAX=1000000):
+    """Final tuned version with aggressive but stable learning"""
     
-    # Reasonable K_bound
+    # K_bound management
     if N < 3000:
         K_bound = 1000.0
     elif N < 10000:
@@ -152,12 +154,12 @@ def phic2_balanced(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, 
     elif N < 20000:
         K_bound = 200.0
     else:
-        K_bound = 100.0
+        K_bound = 150.0  # Slightly higher for large matrices
     
-    K_bound_max = K_bound * 5  # Allow more expansion than before
+    K_bound_max = K_bound * 10  # Allow significant expansion if needed
     
     print("\n" + "="*80)
-    print("Starting PHi-C2 Optimization (BALANCED)")
+    print("Starting PHi-C2 Optimization (FINAL TUNED)")
     print("="*80)
     print(f"Matrix size: {N}x{N}")
     print(f"Initial ETA: {ETA_init:.2e}")
@@ -165,8 +167,8 @@ def phic2_balanced(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, 
     print()
     
     ETA = ETA_init
-    ETA_min = ETA_init * 1e-4  # Don't let it get TOO small
-    ETA_max = ETA_init * 10    # Allow increasing if doing well
+    ETA_min = ETA_init * 1e-3  # Can go quite low but not too low
+    ETA_max = ETA_init * 5     # Allow significant increases
     
     identity = cp.eye(N-1, dtype=cp.float32)
     P_fit = cp.zeros((N, N), dtype=cp.float32)
@@ -189,7 +191,7 @@ def phic2_balanced(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, 
     
     cost_history = []
     consecutive_bad = 0
-    consecutive_good = 0  # Track consecutive improvements
+    consecutive_good = 0
     eta_reduction_count = 0
     eta_increase_count = 0
     k_bound_expansions = 0
@@ -200,28 +202,28 @@ def phic2_balanced(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, 
     while iteration < ITERATION_MAX:
         cost_bk = cost
         
-        # MODERATE gradient clipping
+        # Moderate gradient clipping
         grad_norm = float(cp.sqrt(cp.mean(P_dif**2)))
-        clip_threshold = 2.0  # More lenient than 1.0
+        clip_threshold = 5.0  # Very lenient
         if grad_norm > clip_threshold:
             P_dif = P_dif * (clip_threshold / grad_norm)
         
         # Gradient descent
         K -= ETA * P_dif
         
-        # Check K bounds - MODERATE policy
+        # K bounds - liberal policy
         K_min = float(cp.min(K))
         K_max = float(cp.max(K))
         K_absmax = max(abs(K_min), abs(K_max))
         
-        # Allow 15% overflow before expanding
-        if K_absmax > K_bound * 1.15:
+        # Allow 20% overflow before expanding
+        if K_absmax > K_bound * 1.2:
             if K_bound < K_bound_max:
                 old_bound = K_bound
-                K_bound = min(K_absmax * 1.3, K_bound_max)
+                K_bound = min(K_absmax * 1.4, K_bound_max)
                 k_bound_expansions += 1
-                if k_bound_expansions <= 5:  # Only print first few
-                    print(f"\n  -> K_bound: {old_bound:.1f} -> {K_bound:.1f} (iter {iteration})")
+                if k_bound_expansions <= 5:
+                    print(f"\n  -> K_bound: {old_bound:.1f} -> {K_bound:.1f}")
         
         K = constrain_K(K, K_bound)
         
@@ -229,7 +231,7 @@ def phic2_balanced(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, 
         if cp.any(cp.isnan(K)) or cp.any(cp.isinf(K)):
             print(f"\n  [WARNING] Invalid K at iter {iteration}")
             K = best_K.copy()
-            ETA *= 0.5
+            ETA *= 0.8  # Gentler reduction
             eta_reduction_count += 1
             consecutive_bad = 0
             consecutive_good = 0
@@ -243,7 +245,7 @@ def phic2_balanced(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, 
         except Exception as e:
             print(f"\n  [WARNING] K2P failed: {e}")
             K = best_K.copy()
-            ETA *= 0.5
+            ETA *= 0.8
             eta_reduction_count += 1
             consecutive_bad = 0
             consecutive_good = 0
@@ -255,7 +257,7 @@ def phic2_balanced(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, 
             K2P_inplace(K, P_fit, identity)
             P_dif[...] = P_fit - P_obs
             cost = best_cost
-            ETA *= 0.5
+            ETA *= 0.8
             eta_reduction_count += 1
             consecutive_bad = 0
             consecutive_good = 0
@@ -263,7 +265,7 @@ def phic2_balanced(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, 
         
         cost_delta = cost_bk - cost
         cost_history.append(float(cost))
-        if len(cost_history) > 1000:
+        if len(cost_history) > 2000:
             cost_history.pop(0)
         
         # Update best
@@ -275,25 +277,25 @@ def phic2_balanced(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, 
             consecutive_bad = 0
             consecutive_good += 1
             
-            # INCREASE ETA if making good consistent progress
-            if consecutive_good >= 10 and improvement > 1e-6:
+            # AGGRESSIVE ETA increases when making good progress
+            if consecutive_good >= 5 and improvement > 1e-6:
                 if ETA < ETA_max:
                     old_eta = ETA
-                    ETA = min(ETA * 1.1, ETA_max)
+                    ETA = min(ETA * 1.2, ETA_max)  # 1.2x increase
                     eta_increase_count += 1
-                    if eta_increase_count <= 3:  # Print first few
-                        print(f"\n  [+] ETA increased: {old_eta:.2e} -> {ETA:.2e} (good progress)")
+                    if eta_increase_count <= 5:
+                        print(f"\n  [+] ETA increased: {old_eta:.2e} -> {ETA:.2e}")
                     consecutive_good = 0
         else:
-            if cost_delta < 0:  # Cost increased
+            if cost_delta < 0:
                 consecutive_bad += 1
                 consecutive_good = 0
         
-        # REDUCE ETA only after more bad updates
-        if consecutive_bad >= 7:  # More patient than before
+        # MUCH MORE PATIENT before reducing ETA
+        if consecutive_bad >= 15:  # Was 7 in BALANCED
             print(f"\n  [-] {consecutive_bad} bad updates at iter {iteration}")
-            print(f"      ETA: {ETA:.2e} -> {ETA*0.7:.2e}")  # Gentler reduction
-            ETA *= 0.7  # Not as harsh as 0.5
+            print(f"      ETA: {ETA:.2e} -> {ETA*0.8:.2e}")
+            ETA *= 0.8  # Gentler than 0.7
             eta_reduction_count += 1
             K = best_K.copy()
             K2P_inplace(K, P_fit, identity)
@@ -307,14 +309,15 @@ def phic2_balanced(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, 
                 break
         
         # Progress reporting
-        if iteration == 1 or iteration % 200 == 0 or time.time() - last_print > 15:
+        if iteration == 1 or iteration % 500 == 0 or time.time() - last_print > 20:
             elapsed = time.time() - c_traj[0][1]
             rate = iteration / elapsed if elapsed > 0 else 0
             since_best = iteration - best_iter
+            improvement_pct = 100 * (c_traj[0][0] - best_cost) / c_traj[0][0]
             
             print(f"Iter {iteration:7d} | Cost: {cost:.6e} | dCost: {cost_delta:+.2e} | "
                   f"Best: {best_cost:.6e} | ETA: {ETA:.2e}")
-            print(f"  Rate: {rate:.2f} it/s | Since best: {since_best} | "
+            print(f"  Improvement: {improvement_pct:.2f}% | Since best: {since_best} | "
                   f"ETA red/inc: {eta_reduction_count}/{eta_increase_count} | K_bound: {K_bound:.1f}")
             print_memory()
             
@@ -322,36 +325,34 @@ def phic2_balanced(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, 
             last_print = time.time()
         
         # Checkpointing
-        if iteration - last_checkpoint >= 1000:
+        if iteration - last_checkpoint >= 2000:
             cp_file = save_checkpoint(K, float(cost), iteration, checkpoint_dir)
             last_checkpoint = iteration
-            if iteration % 5000 == 0:
-                print(f"  -> Checkpoint: {os.path.basename(cp_file)}")
+            print(f"  -> Checkpoint: {os.path.basename(cp_file)}")
         
         # Convergence checks
-        if iteration > 1000:
-            # Check if improvement is negligible
-            recent_window = min(500, len(cost_history))
-            if recent_window >= 200:
+        if iteration > 2000:
+            recent_window = min(1000, len(cost_history))
+            if recent_window >= 500:
                 recent_improvement = (cost_history[-recent_window] - cost) / cost_history[-recent_window]
-                if recent_improvement < 1e-5 and iteration - best_iter > recent_window:
-                    print(f"\n[CONVERGED] < 0.001% improvement over {recent_window} iterations")
+                if recent_improvement < 5e-5:  # 0.005% improvement
+                    print(f"\n[CONVERGED] < 0.005% improvement over {recent_window} iterations")
                     break
         
         # Max stagnation
-        max_stag = max(10000, N // 3)
+        max_stag = max(15000, N // 2)
         if iteration - best_iter > max_stag:
             print(f"\n[STOP] No improvement for {max_stag} iterations")
             break
         
-        # Max iterations with low ETA
-        if ETA < ETA_min * 10 and iteration - best_iter > 5000:
-            print(f"\n[STOP] ETA very low and no progress")
+        # Max iterations
+        if iteration > 100000:
+            print(f"\n[STOP] Reached 100K iterations")
             break
         
         iteration += 1
         
-        if iteration % 500 == 0:
+        if iteration % 1000 == 0:
             cp.get_default_memory_pool().free_all_blocks()
     
     # Use best K
@@ -453,7 +454,7 @@ if __name__ == "__main__":
     
     input_basename = os.path.basename(fhic)
     input_name = os.path.splitext(input_basename)[0]
-    dataDir = f"{input_name}_phic2_BALANCED"
+    dataDir = f"{input_name}_phic2_FINAL_TUNED"
     os.makedirs(dataDir, exist_ok=True)
     checkpoint_dir = f"{dataDir}/checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -465,7 +466,7 @@ if __name__ == "__main__":
     print("="*80)
     start_opt = time.time()
     
-    K_fit, P_fit, c_traj, paras_fit = phic2_balanced(
+    K_fit, P_fit, c_traj, paras_fit = phic2_final_tuned(
         K_fit, N, P_obs, checkpoint_dir,
         ETA_init=ETA_init,
         ALPHA=1.0e-10,
@@ -533,7 +534,7 @@ if __name__ == "__main__":
     summary_file = f"{dataDir}/SUMMARY_{input_name}.txt"
     with open(summary_file, 'w') as f:
         f.write("="*80 + "\n")
-        f.write("PHi-C2 OPTIMIZATION SUMMARY\n")
+        f.write("PHi-C2 OPTIMIZATION SUMMARY (FINAL TUNED)\n")
         f.write("="*80 + "\n\n")
         f.write(f"Input file:                {os.path.basename(fhic)}\n")
         f.write(f"Matrix size:               {N}x{N}\n")
@@ -549,6 +550,16 @@ if __name__ == "__main__":
         f.write(f"  Pearson (obs>0):         {p2:.6f}\n")
         f.write(f"  K range:                 [{np.min(K_fit):.5e}, {np.max(K_fit):.5e}]\n")
         f.write("="*80 + "\n")
+        
+        if p1 >= 0.90:
+            f.write("\nQUALITY: EXCELLENT (>0.90)\n")
+        elif p1 >= 0.85:
+            f.write("\nQUALITY: GOOD (>0.85)\n")
+        elif p1 >= 0.75:
+            f.write("\nQUALITY: ACCEPTABLE (>0.75)\n")
+        else:
+            f.write("\nQUALITY: POOR (<0.75)\n")
+            f.write("Consider coarser resolution (200KB, 500KB, or 1MB)\n")
     
     print(f"  [OK] Saved summary: {summary_file}")
     
@@ -558,19 +569,21 @@ if __name__ == "__main__":
     print(f"Matrix:                    {N}x{N}")
     print(f"Total time:                {total_time/60:.1f} min ({total_time/3600:.1f} hours)")
     print(f"Iterations:                {len(c_traj_np):,}")
+    print(f"Improvement:               {100*(c_traj_np[0,0]-c_traj_np[-1,0])/c_traj_np[0,0]:.2f}%")
     print(f"Pearson (full, all):       {p1:.6f}")
     print(f"Pearson (full, obs>0):     {p2:.6f}")
     print(f"Output directory:          {dataDir}/")
     print("="*80)
     
     if p1 >= 0.90:
-        print("\n[EXCELLENT] Pearson > 0.90")
+        print("\n✓✓ EXCELLENT! Pearson > 0.90")
     elif p1 >= 0.85:
-        print("\n[GOOD] Pearson > 0.85")
+        print("\n✓ GOOD! Pearson > 0.85")
     elif p1 >= 0.75:
-        print("\n[ACCEPTABLE] Pearson > 0.75")
+        print("\n△ ACCEPTABLE. Pearson > 0.75")
     else:
-        print("\n[POOR] Pearson < 0.75 - Consider coarser resolution")
+        print("\n✗ POOR. Pearson < 0.75")
+        print("   RECOMMENDATION: Use coarser resolution (200KB-1MB)")
     
     print(f"\nAll files saved to: {dataDir}/")
     print("Done!")
