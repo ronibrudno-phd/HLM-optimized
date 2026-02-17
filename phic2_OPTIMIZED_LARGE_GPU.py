@@ -101,39 +101,43 @@ def cost_func(P_dif, N):
     return cp.sqrt(cp.sum(P_dif**2)) / N
 
 def estimate_eta(P_obs, K_init, N, identity, P_temp):
-    """EMPIRICALLY TUNED for large matrices"""
+    """
+    EMPIRICALLY TUNED for large matrices.
+    Key insight: ETA must scale with the initial cost, not just matrix size.
+    WT cost ~2.7e-4 worked at ETA ~2e-4.
+    Treatment cost ~4.3e-4 needs proportionally higher ETA.
+    """
     print("\nEstimating initial learning rate...")
     K2P_inplace(K_init, P_temp, identity)
     grad_norm = cp.sqrt(cp.mean((P_temp - P_obs)**2))
+    initial_cost = float(cp.sqrt(cp.sum((P_temp - P_obs)**2)) / N)
     
     print(f"  Initial gradient norm: {float(grad_norm):.5e}")
+    print(f"  Initial cost estimate: {initial_cost:.5e}")
     
-    # MUCH MORE AGGRESSIVE for large matrices
-    # Based on empirical observation: need ~2e-4 for 27K matrix
+    # Base ETA tuned for N>25K matrices at cost ~2.7e-4 (WT reference)
     if N > 25000:
-        # Very large matrices: use fixed aggressive rate
-        eta = 2e-4
-        print(f"  Using empirically tuned ETA for N={N}")
+        base_eta = 2e-4
     elif N > 20000:
-        eta = 3e-4
+        base_eta = 3e-4
     elif N > 15000:
-        eta = 4e-4
+        base_eta = 4e-4
     elif N > 10000:
-        eta = 5e-4
-    else:
-        # Smaller matrices: use formula
         base_eta = 5e-4
-        size_factor = (5000.0 / N)**0.5
-        eta = base_eta * size_factor
+    else:
+        base_eta = 5e-4 * (5000.0 / N)**0.5
     
-    # Adjust based on gradient magnitude (but not too much)
-    grad_factor = min(2.0, max(0.5, 1e-3 / float(grad_norm)))
-    eta = eta * grad_factor
+    # CRITICAL: Scale ETA by initial cost relative to WT reference (2.7e-4)
+    # Higher initial cost = steeper landscape = need proportionally higher ETA
+    reference_cost = 2.7e-4
+    cost_scale = initial_cost / reference_cost
+    base_eta = base_eta * cost_scale
     
-    # Safety bounds
-    eta = np.clip(eta, 1e-5, 1e-3)
+    print(f"  Cost scale factor: {cost_scale:.4f} (vs reference {reference_cost:.1e})")
     
-    print(f"  Gradient adjustment factor: {grad_factor:.4f}")
+    # Safety bounds - wider range to accommodate different datasets
+    eta = np.clip(base_eta, 1e-5, 5e-3)
+    
     print(f"  Final ETA: {eta:.2e}")
     return eta
 
@@ -154,7 +158,7 @@ def phic2_final_tuned(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-1
     elif N < 20000:
         K_bound = 200.0
     else:
-        K_bound = 150.0  # Slightly higher for large matrices
+        K_bound = 200.0  # Raised from 150 - treatment matrices need more room
     
     K_bound_max = K_bound * 10  # Allow significant expansion if needed
     
@@ -167,7 +171,7 @@ def phic2_final_tuned(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-1
     print()
     
     ETA = ETA_init
-    ETA_min = ETA_init * 1e-3  # Can go quite low but not too low
+    ETA_min = ETA_init * 5e-4  # Allow ETA to decay much further (was 1e-3)
     ETA_max = ETA_init * 5     # Allow significant increases
     
     identity = cp.eye(N-1, dtype=cp.float32)
