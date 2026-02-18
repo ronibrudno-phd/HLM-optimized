@@ -338,7 +338,7 @@ def phic2_final_tuned(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-1
             last_print = time.time()
         
         # Checkpointing
-        if iteration - last_checkpoint >= 2000:
+        if iteration - last_checkpoint >= 10000:
             cp_file = save_checkpoint(K, float(cost), iteration, checkpoint_dir)
             last_checkpoint = iteration
             print(f"  -> Checkpoint: {os.path.basename(cp_file)}")
