@@ -17,13 +17,20 @@ except ImportError:
 cp.set_printoptions(precision=3, linewidth=200)
 warnings.filterwarnings('ignore')
 
-# FINAL TUNED VERSION v2
-# Five fixes applied:
-#   Fix 1: assume_a='sym' instead of 'pos' — correct for non-PSD Laplacian
-#   Fix 2: eps_diag raised 1e-5 → 1e-4 — sufficient regularization
-#   Fix 3: K_inter >= 0 enforced — correct territory positioning for all species
-#   Fix 4: estimate_eta without reference_cost heuristic — species-agnostic
-#   Fix 5: ETA_min = ETA_init*1e-2 instead of *5e-4 — more productive iterations
+# FINAL TUNED VERSION v2 — Option 2
+# Three numerical stability fixes applied (no inter-chromosomal constraint):
+#   Fix 1: assume_a='sym' — correct for non-PSD Laplacian (was 'pos')
+#   Fix 2: eps_diag=1e-4  — sufficient regularization for negative eigenvalues
+#   Fix 4: ETA from matrix size only — no species-specific reference cost
+#   Fix 5: ETA_min=ETA*1e-2 — more productive iterations (was ETA*5e-4)
+#
+# Strategy: Option 2
+#   - K matrix is fitted without inter-chromosomal constraints
+#   - Negative inter-chromosomal K values are accepted (encode some A/B signal)
+#   - Chromosome territory positioning uses q_rad_intra (per-chromosome radial)
+#   - q_rad_intra normalizes within each chromosome territory, removing
+#     the cross-chromosomal centroid-pulling artifact entirely
+#   - This is the uniform pipeline: same optimizer for all 30 species
 
 if not len(sys.argv) >= 2:
     print("usage:: python phic2_final.py normalized-HiC-Contact-Matrix")
@@ -32,14 +39,15 @@ if not len(sys.argv) >= 2:
 fhic = str(sys.argv[1])
 
 print("="*80)
-print("PHi-C2 FINAL TUNED VERSION v2")
+print("PHi-C2 FINAL TUNED VERSION v2 — Option 2")
 print("="*80)
-print("Fixes applied:")
-print("  [1] assume_a='sym' — correct for non-PSD Laplacian (was 'pos')")
-print("  [2] eps_diag=1e-4  — sufficient regularization (was 1e-5)")
-print("  [3] K_inter >= 0   — inter-chromosomal non-negativity constraint")
-print("  [4] ETA from matrix size only — no species-specific reference cost")
-print("  [5] ETA_min=ETA*1e-2 — more productive iterations (was ETA*5e-4)")
+print("Numerical stability fixes:")
+print("  [1] assume_a='sym'  — LDL^T factorization, correct for non-PSD Laplacian")
+print("  [2] eps_diag=1e-4   — sufficient regularization for negative eigenvalues")
+print("  [4] ETA from N only — no species-specific reference cost heuristic")
+print("  [5] ETA_min=ETA*1e-2 — 2 orders of decay max (was 4)")
+print("Radial strategy: q_rad_intra (per-chromosome normalization)")
+print("  Chromosomes floated freely; territory positioning via 1Mb model")
 print("="*80)
 
 _SOLVE_SUPPORTS_ASSUME_A = True
@@ -72,20 +80,18 @@ def K2P_inplace(K, out_P, identity, eps_diag=1e-4, rc2=1.0):
     """
     K to P conversion using solve() with assume_a='sym'.
 
-    FIX 1 (critical): was assume_a='pos' which requires L11 to be positive
-    definite (PD). L11 is the Laplacian submatrix; when K has negative entries
-    (as in mouse at 100kb where 85% of inter-chromosomal K values are negative)
-    L11 is NOT PD. Cholesky factorization on a non-PD matrix produces NaN
-    silently, causing the optimizer to reset and reduce ETA hundreds of times
-    before hitting ETA_min — which is why the run stopped at only 50 iterations.
-    assume_a='sym' uses LDL^T factorization, which handles any symmetric matrix
-    including indefinite ones. This is correct for all species.
+    Fix 1: assume_a changed from 'pos' to 'sym'.
+    'pos' uses Cholesky and requires L11 to be positive definite.
+    With negative K entries (common at 100kb resolution), L11 is NOT
+    positive definite — Cholesky produces NaN silently, causing the
+    optimizer to reset and reduce ETA until it stops after ~50 iterations.
+    'sym' uses LDL^T which handles any symmetric matrix including indefinite.
+    This is correct for all species at all resolutions.
 
-    FIX 2: eps_diag raised from 1e-5 to 1e-4. The regularization must be large
-    enough to shift the smallest eigenvalue of L11 positive even when K has
-    negative eigenvalues as small as -9.7e-5 (measured for musmus). 1e-5 is
-    insufficient; 1e-4 provides a safe margin while remaining negligible relative
-    to the typical spring constant magnitude (~0.5 for backbone springs).
+    Fix 2: eps_diag raised from 1e-5 to 1e-4.
+    Regularization must exceed the magnitude of the most negative eigenvalue
+    of L11. For mouse at 100kb, the most negative Laplacian eigenvalue is
+    ~9.7e-5. Using 1e-4 provides a safe margin across all species.
     """
     N = K.shape[0]
     d = cp.sum(K, axis=0, dtype=cp.float32)
@@ -116,40 +122,9 @@ def K2P_inplace(K, out_P, identity, eps_diag=1e-4, rc2=1.0):
     del Q, L11, A, sub, d
     return out_P
 
-def constrain_K(K, K_bound, inter_mask=None, intra_mask=None):
-    """
-    Apply physical constraints to K:
-      1. Symmetric  (Newton's 3rd law — always applied)
-      2. Bounded magnitude  (prevents overflow)
-      3. Inter-chromosomal non-negativity  (applied when masks are provided)
-
-    FIX 3 (biological): In the HLM model, K[i,j] represents a harmonic spring
-    constant between bins i and j. Negative K means repulsion. For bins on
-    DIFFERENT chromosomes, repulsive springs have no physical justification in
-    the HLM energy function. They arise at 100kb resolution because the
-    optimizer finds that K_inter = -epsilon gives a slightly lower cost than
-    K_inter = 0 for the many near-zero inter-chromosomal contacts. But those
-    tiny negative values make the Laplacian non-PSD, which corrupts the
-    radial position metric q_rad and places large chromosomes at the nuclear
-    center instead of the periphery.
-
-    Enforcing K_inter >= 0 prevents this drift without affecting the
-    intra-chromosomal A/B compartment signal, which is encoded by negative
-    K values between compartment-separated intra-chromosomal bin pairs.
-    This constraint is applied uniformly to all species — it reflects a
-    physical property of the model, not a species-specific tuning choice.
-
-    inter_mask: cupy bool array, True where bins are on different chromosomes.
-    intra_mask: cupy bool array, True where bins are on the same chromosome.
-    If not provided (e.g. no bins file given), only symmetry and bound applied.
-    """
-    # 1. Symmetry
+def constrain_K(K, K_bound):
     K = 0.5 * (K + K.T)
-    # 2. Magnitude bound
     K = cp.clip(K, -K_bound, K_bound)
-    # 3. Inter-chromosomal non-negativity
-    if inter_mask is not None and intra_mask is not None:
-        K = K * intra_mask + cp.maximum(K, cp.float32(0.0)) * inter_mask
     return K
 
 def cost_func(P_dif, N):
@@ -157,18 +132,15 @@ def cost_func(P_dif, N):
 
 def estimate_eta(N):
     """
-    Set initial learning rate based on matrix size.
+    Set initial ETA from matrix size only.
 
-    FIX 4: The previous implementation scaled ETA by (initial_cost / 2.7e-4)
-    where 2.7e-4 was a hardcoded reference cost tuned to one specific dataset
-    (mouse WT thymocytes). For other species and cell types, this produced
-    wildly different starting ETAs that were often too large, causing immediate
-    numerical instability and stopping after ~50 iterations.
-
-    ETA is now set directly from matrix size alone, which is the principled
-    approach — larger matrices have more bins per unit cost change, so need
-    smaller steps. These values are conservative enough to be stable for any
-    species while still making meaningful progress per iteration.
+    Fix 4: previous version scaled ETA by (initial_cost / 2.7e-4) where
+    2.7e-4 was hardcoded to one specific dataset. For other species this
+    produced inconsistent starting ETAs — too large causes immediate NaN
+    cascade, too small causes no progress. Size-based ETA is species-agnostic
+    and stable across the full range of N in the species panel (N~1000 to ~35000).
+    Hard cap at 1e-3 prevents instability for very small matrices (e.g.
+    small-genome invertebrates at 1Mb resolution where N can be ~100-200).
     """
     if N > 25000:
         eta = 5e-5
@@ -180,7 +152,7 @@ def estimate_eta(N):
         eta = 2e-4
     else:
         eta = 2e-4 * (10000.0 / N) ** 0.5
-
+    eta = min(eta, 1e-3)
     print(f"\nInitial ETA: {eta:.2e}  (matrix size N={N})")
     return eta
 
@@ -190,17 +162,9 @@ def save_checkpoint(K, cost, iteration, checkpoint_dir):
     np.savez_compressed(cp_file, K=K_cpu, cost=cost, iteration=iteration)
     return cp_file
 
-def phic2_final_tuned(K, N, P_obs, checkpoint_dir,
-                       ETA_init=5e-5, ALPHA=1.0e-10, ITERATION_MAX=1000000,
-                       inter_mask=None, intra_mask=None):
-    """
-    PHi-C2 optimizer with all five fixes applied.
-
-    inter_mask / intra_mask: cupy bool arrays (N×N) for Fix 3.
-        Build from bins file before calling. If None, inter-chromosomal
-        non-negativity constraint is skipped (backwards compatible).
-    """
-
+def phic2_final_tuned(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-10, ITERATION_MAX=1000000):
+    """Final tuned version with aggressive but stable learning"""
+    
     # K_bound management
     if N < 3000:
         K_bound = 1000.0
@@ -209,35 +173,26 @@ def phic2_final_tuned(K, N, P_obs, checkpoint_dir,
     elif N < 20000:
         K_bound = 200.0
     else:
-        K_bound = 200.0
-
-    K_bound_max = K_bound * 10
-
+        K_bound = 200.0  # Raised from 150 - treatment matrices need more room
+    
+    K_bound_max = K_bound * 10  # Allow significant expansion if needed
+    
     print("\n" + "="*80)
-    print("Starting PHi-C2 Optimization (FINAL TUNED v2)")
+    print("Starting PHi-C2 Optimization (FINAL TUNED)")
     print("="*80)
     print(f"Matrix size: {N}x{N}")
     print(f"Initial ETA: {ETA_init:.2e}")
     print(f"K bound: +/-{K_bound:.1f} (max: +/-{K_bound_max:.1f})")
-    if inter_mask is not None:
-        n_inter = int(cp.sum(inter_mask))
-        n_intra = int(cp.sum(intra_mask))
-        print(f"Inter-chromosomal constraint: ENABLED")
-        print(f"  Inter-chr pairs: {n_inter:,} ({100*n_inter/(N*N):.1f}%)")
-        print(f"  Intra-chr pairs: {n_intra:,} ({100*n_intra/(N*N):.1f}%)")
-    else:
-        print(f"Inter-chromosomal constraint: DISABLED (no bins file provided)")
     print()
-
+    
     ETA = ETA_init
-    # FIX 5: ETA_min raised from ETA_init*5e-4 to ETA_init*1e-2.
-    # The previous value allowed ETA to decay 4 orders of magnitude below start,
-    # which combined with the assume_a='pos' NaN cascade caused termination after
-    # only ~50 productive iterations. At most 2 orders of magnitude of decay is
-    # appropriate — beyond that the optimizer is stagnated and should stop via
-    # convergence or stagnation checks, not ETA exhaustion.
+    # Fix 5: ETA_min raised from ETA_init*5e-4 to ETA_init*1e-2.
+    # 4 orders of magnitude of ETA decay caused the optimizer to stop via
+    # ETA exhaustion rather than genuine convergence. 2 orders of magnitude
+    # is the appropriate maximum decay — beyond that, use stagnation/convergence
+    # checks to stop instead.
     ETA_min = ETA_init * 1e-2
-    ETA_max = ETA_init * 5
+    ETA_max = ETA_init * 5     # Allow significant increases
     
     identity = cp.eye(N-1, dtype=cp.float32)
     P_fit = cp.zeros((N, N), dtype=cp.float32)
@@ -294,7 +249,7 @@ def phic2_final_tuned(K, N, P_obs, checkpoint_dir,
                 if k_bound_expansions <= 5:
                     print(f"\n  -> K_bound: {old_bound:.1f} -> {K_bound:.1f}")
         
-        K = constrain_K(K, K_bound, inter_mask, intra_mask)
+        K = constrain_K(K, K_bound)
         
         # Sanity checks
         if cp.any(cp.isnan(K)) or cp.any(cp.isinf(K)):
@@ -496,24 +451,14 @@ def saveMx(fn, xy, ct, chunk_size=5000):
 
 if __name__ == "__main__":
     start_total = time.time()
-
-    # --- Parse arguments ---
-    # Usage: python phic2_FINAL_TUNED.py <hic_matrix> [<bins_file>]
-    # bins_file is optional but strongly recommended — it enables the
-    # inter-chromosomal non-negativity constraint (Fix 3).
-    if len(sys.argv) < 2:
-        print("usage:: python phic2_FINAL_TUNED.py hic_matrix [bins_file]")
-        sys.exit(1)
-
-    fbins = str(sys.argv[2]) if len(sys.argv) >= 3 else None
-
+    
     if not os.path.isfile(fhic):
         print(f'ERROR: Cannot find {fhic}')
         sys.exit(1)
-
+    
     print(f"\nLoading Hi-C matrix: {fhic}")
     start_load = time.time()
-
+    
     P_obs = []
     with open(fhic) as fr:
         for line in fr:
@@ -521,16 +466,16 @@ if __name__ == "__main__":
                 P_obs.append(list(map(float, line.strip().split())))
                 if len(P_obs) % 5000 == 0:
                     print(f"  {len(P_obs)} rows...")
-
+    
     P_obs = cp.array(P_obs, dtype=cp.float32)
     N = len(P_obs)
-
+    
     load_time = time.time() - start_load
     print(f"\n[OK] Loaded {N}x{N} in {load_time:.1f}s")
-
+    
     cp.nan_to_num(P_obs, copy=False)
     P_obs = P_obs + cp.eye(N, dtype=cp.float32)
-
+    
     P_obs_cpu = cp.asnumpy(P_obs)
     nonzero = int(np.count_nonzero(P_obs_cpu))
     sparsity = 100 * (1 - nonzero/(N*N))
@@ -540,54 +485,23 @@ if __name__ == "__main__":
     print(f"  Mean: {float(cp.mean(P_obs)):.2e}")
     del P_obs_cpu
     print_memory()
-
-    # --- Build inter/intra chromosome masks (Fix 3) ---
-    inter_mask = None
-    intra_mask = None
-    if fbins is not None:
-        print(f"\nBuilding chromosome masks from: {fbins}")
-        chrom_labels = []
-        with open(fbins) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                parts = line.split()
-                # Support both: "bin_id chr start end" and "chr start end"
-                chrom = parts[1] if len(parts) >= 4 else parts[0]
-                chrom_labels.append(chrom)
-        if len(chrom_labels) != N:
-            print(f"  WARNING: bins file has {len(chrom_labels)} rows but matrix is {N}x{N}.")
-            print(f"  Skipping inter-chromosomal constraint.")
-        else:
-            chrom_arr = np.array(chrom_labels)
-            # inter_mask[i,j] = True if chr[i] != chr[j]
-            inter_np = chrom_arr[:, None] != chrom_arr[None, :]
-            inter_mask = cp.array(inter_np, dtype=cp.float32)
-            intra_mask = cp.float32(1.0) - inter_mask
-            n_inter = int(np.sum(inter_np))
-            print(f"  Chromosomes: {len(np.unique(chrom_arr))}")
-            print(f"  Inter-chr pairs: {n_inter:,} ({100*n_inter/(N*N):.1f}%)")
-            del inter_np, chrom_arr
-    else:
-        print("\nNo bins file provided — inter-chromosomal constraint disabled.")
-        print("Re-run with bins file to enforce K_inter >= 0:")
-        print("  python phic2_FINAL_TUNED.py hic_matrix bins_file")
-
-    # --- Initialize K ---
+    
     print("\nInitializing spring constants...")
     K_fit = Init_K(N, 0.5, cp.float32)
-
-    # --- Estimate ETA (Fix 4: no reference_cost heuristic) ---
+    
+    P_temp = cp.zeros((N, N), dtype=cp.float32)
+    identity_temp = cp.eye(N-1, dtype=cp.float32)
     ETA_init = estimate_eta(N)
-
-    # --- Output directories ---
+    del P_temp, identity_temp
+    gc.collect()
+    
     input_basename = os.path.basename(fhic)
     input_name = os.path.splitext(input_basename)[0]
     dataDir = f"{input_name}_phic2_FINAL_TUNED"
     os.makedirs(dataDir, exist_ok=True)
     checkpoint_dir = f"{dataDir}/checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
+    
     print(f"\nOutput directory: {dataDir}/")
     
     print("\n" + "="*80)
@@ -599,9 +513,7 @@ if __name__ == "__main__":
         K_fit, N, P_obs, checkpoint_dir,
         ETA_init=ETA_init,
         ALPHA=1.0e-10,
-        ITERATION_MAX=1000000,
-        inter_mask=inter_mask,
-        intra_mask=intra_mask,
+        ITERATION_MAX=1000000
     )
     
     opt_time = time.time() - start_opt
@@ -680,14 +592,6 @@ if __name__ == "__main__":
         f.write(f"  Pearson (all):           {p1:.6f}\n")
         f.write(f"  Pearson (obs>0):         {p2:.6f}\n")
         f.write(f"  K range:                 [{np.min(K_fit):.5e}, {np.max(K_fit):.5e}]\n")
-        k_neg_frac = float(np.mean(K_fit < 0))
-        k_inter_neg_frac = float('nan')
-        if inter_mask is not None:
-            inter_np_final = cp.asnumpy(inter_mask).astype(bool)
-            k_inter_neg_frac = float(np.mean(K_fit[inter_np_final] < 0))
-            del inter_np_final
-        f.write(f"  K negative fraction:     {k_neg_frac:.4f}\n")
-        f.write(f"  K inter-chr neg frac:    {k_inter_neg_frac:.4f}  (should be 0.0 if Fix 3 applied)\n")
         f.write("="*80 + "\n")
         
         if p1 >= 0.90:
