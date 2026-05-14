@@ -58,7 +58,7 @@ print("="*80)
 print("Matches paper's K2P exactly (no eps_diag, no out_P floor).")
 print("Kept from v2:")
 print("  - assume_a='sym' (LDL^T factorization)")
-print("  - K symmetrization each step (float32 hygiene)")
+print("  - K symmetrization each step (float64 hygiene)")
 print("  - ETA from N at initialization")
 print("  - Best-K tracking + backup on detected problems")
 print("Removed from v2:")
@@ -70,7 +70,7 @@ print("="*80)
 
 _SOLVE_SUPPORTS_ASSUME_A = True
 try:
-    test = cp.eye(2, dtype=cp.float32)
+    test = cp.eye(2, dtype=cp.float64)
     cp.linalg.solve(test, test, assume_a='sym')
     del test
 except TypeError:
@@ -129,9 +129,9 @@ def K2P_inplace(K, out_P, identity, rc2=1.0):
                will contain NaN. Caller should back up.
     """
     N = K.shape[0]
-    d = cp.sum(K, axis=0, dtype=cp.float32)
+    d = cp.sum(K, axis=0, dtype=cp.float64)
     L11 = (-K[1:, 1:]).copy()
-    idx = cp.arange(N - 1, dtype=cp.int32)
+    idx = cp.arange(N - 1, dtype=cp.int64)
     L11[idx, idx] += d[1:]
     # No eps_diag. No regularization. Paper's K2P does not add it.
 
@@ -149,8 +149,8 @@ def K2P_inplace(K, out_P, identity, rc2=1.0):
     out_P[0, 1:N] = A
     out_P[1:N, 0] = A
 
-    out_P *= cp.float32(3.0 / rc2)
-    out_P += cp.float32(1.0)
+    out_P *= cp.float64(3.0 / rc2)
+    out_P += cp.float64(1.0)
 
     # Detect non-positive entries instead of flooring. Caller will react.
     n_nonpos = int(cp.sum(out_P <= 0))
@@ -158,7 +158,7 @@ def K2P_inplace(K, out_P, identity, rc2=1.0):
     # Apply the power operation. Where out_P > 0 this is well-defined;
     # where out_P <= 0 it will produce NaN, which the caller's NaN check
     # will catch. We don't floor.
-    cp.power(out_P, cp.float32(-1.5), out=out_P)
+    cp.power(out_P, cp.float64(-1.5), out=out_P)
 
     del Q, L11, A, sub, d
     return out_P, n_nonpos
@@ -245,9 +245,9 @@ def phic2_final_tuned(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-1
     ETA_min = ETA_init * 1e-2
     ETA_max = ETA_init * 5     # Allow significant increases
     
-    identity = cp.eye(N-1, dtype=cp.float32)
-    P_fit = cp.zeros((N, N), dtype=cp.float32)
-    P_dif = cp.zeros((N, N), dtype=cp.float32)
+    identity = cp.eye(N-1, dtype=cp.float64)
+    P_fit = cp.zeros((N, N), dtype=cp.float64)
+    P_dif = cp.zeros((N, N), dtype=cp.float64)
     
     _, _n_nonpos = K2P_inplace(K, P_fit, identity)
     P_dif[...] = P_fit - P_obs
@@ -281,7 +281,7 @@ def phic2_final_tuned(K, N, P_obs, checkpoint_dir, ETA_init=1.0e-6, ALPHA=1.0e-1
         # Gradient descent (paper convention: no gradient clipping)
         K -= ETA * P_dif
         
-        # Symmetrize K (paper does not, but float32 introduces asymmetry
+        # Symmetrize K (paper does not, but float64 introduces asymmetry
         # over many gradient updates; this is the one piece of numerical
         # hygiene I keep).
         K = 0.5 * (K + K.T)
@@ -543,14 +543,14 @@ if __name__ == "__main__":
                 if len(P_obs) % 5000 == 0:
                     print(f"  {len(P_obs)} rows...")
     
-    P_obs = cp.array(P_obs, dtype=cp.float32)
+    P_obs = cp.array(P_obs, dtype=cp.float64)
     N = len(P_obs)
     
     load_time = time.time() - start_load
     print(f"\n[OK] Loaded {N}x{N} in {load_time:.1f}s")
     
     cp.nan_to_num(P_obs, copy=False)
-    P_obs = P_obs + cp.eye(N, dtype=cp.float32)
+    P_obs = P_obs + cp.eye(N, dtype=cp.float64)
     
     P_obs_cpu = cp.asnumpy(P_obs)
     nonzero = int(np.count_nonzero(P_obs_cpu))
@@ -563,10 +563,10 @@ if __name__ == "__main__":
     print_memory()
     
     print("\nInitializing spring constants...")
-    K_fit = Init_K(N, 0.5, cp.float32)
+    K_fit = Init_K(N, 0.5, cp.float64)
     
-    P_temp = cp.zeros((N, N), dtype=cp.float32)
-    identity_temp = cp.eye(N-1, dtype=cp.float32)
+    P_temp = cp.zeros((N, N), dtype=cp.float64)
+    identity_temp = cp.eye(N-1, dtype=cp.float64)
     ETA_init = estimate_eta(N)
     del P_temp, identity_temp
     gc.collect()
@@ -620,8 +620,8 @@ if __name__ == "__main__":
     def pearson_sample(P_fit_arr, P_obs_arr, n_samples=1_000_000, seed=0):
         rng = np.random.default_rng(seed)
         N = P_obs_arr.shape[0]
-        i = rng.integers(0, N - 1, size=n_samples, dtype=np.int32)
-        j = rng.integers(i + 1, N, size=n_samples, dtype=np.int32)
+        i = rng.integers(0, N - 1, size=n_samples, dtype=np.int64)
+        j = rng.integers(i + 1, N, size=n_samples, dtype=np.int64)
         obs = P_obs_arr[i, j]
         fit = P_fit_arr[i, j]
         p1 = float(np.corrcoef(fit, obs)[0, 1])
